@@ -45,8 +45,8 @@ Amvera поддерживает фоновые long-running процессы (б
    | `BOT_TOKEN` | токен от BotFather |
    | `GLM_API_KEY` | ключ с z.ai |
    | `ALLOWED_CHAT_IDS` | твой chat_id (можно несколько через запятую) |
-   | `GLM_MODEL` | `glm-4.6` (по умолчанию) |
-   | `GLM_BASE_URL` | `https://api.z.ai/api/paas/v4` |
+   | `GLM_MODEL` | `glm-5.2` (по умолчанию, GLM Coding Plan) |
+   | `GLM_BASE_URL` | `https://api.z.ai/api/coding/paas/v4` |
 
    ⚠️ После добавления секретов — **перезапусти контейнер**.
 

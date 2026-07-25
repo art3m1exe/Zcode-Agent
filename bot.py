@@ -25,8 +25,8 @@ except ImportError:
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GLM_API_KEY = os.environ.get("GLM_API_KEY", "")
-GLM_BASE_URL = os.environ.get("GLM_BASE_URL", "https://api.z.ai/api/paas/v4")
-DEFAULT_MODEL = os.environ.get("GLM_MODEL", "glm-4.6")
+GLM_BASE_URL = os.environ.get("GLM_BASE_URL", "https://api.z.ai/api/coding/paas/v4")
+DEFAULT_MODEL = os.environ.get("GLM_MODEL", "glm-5.2")
 
 ALLOWED_IDS = {
     int(x)
@@ -34,7 +34,7 @@ ALLOWED_IDS = {
     if x
 }
 
-ALLOWED_MODELS = {"glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.5-flash"}
+ALLOWED_MODELS = {"glm-5.2", "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.5-flash"}
 
 HISTORY_LIMIT = 20        # последних пар (user+assistant) в контексте
 TG_MSG_LIMIT = 4000       # запас от лимита Telegram в 4096
