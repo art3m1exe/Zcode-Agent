@@ -181,14 +181,16 @@ def _mask(value: str) -> str:
 
 
 async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    log.info("Bot started. Allowed chat_ids: %s", sorted(ALLOWED_IDS) or "(none)")
-    # Диагностика env: чтобы в логах amvera видеть, какие значения реально подставились.
+    # Диагностика env ПЕРВЫМ делом — до любых сетевых вызовов к Telegram/GLM.
+    # Если токен невалиден, delete_webhook упадёт и роняет весь процесс,
+    # но эти строки уже успеют попасть в лог amvera.
+    log.info("Bot starting. Allowed chat_ids: %s", sorted(ALLOWED_IDS) or "(none)")
     log.info("ENV BOT_TOKEN=%s", _mask(BOT_TOKEN))
     log.info("ENV GLM_API_KEY=%s", _mask(GLM_API_KEY))
     log.info("ENV GLM_BASE_URL=%s", GLM_BASE_URL)
     log.info("ENV GLM_MODEL=%s", DEFAULT_MODEL)
     log.info("ENV ALLOWED_CHAT_IDS=%s", sorted(ALLOWED_IDS))
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
