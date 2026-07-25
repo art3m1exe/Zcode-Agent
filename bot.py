@@ -112,14 +112,20 @@ async def handle_text(message: Message):
     placeholder = await message.answer("…")
     buf = ""
     last_update = time.monotonic()
+    actual_model = None
 
     try:
+        log.info("GLM request: requested model=%s", model)
         stream = await glm.chat.completions.create(
             model=model,
             messages=history[chat_id],
             stream=True,
         )
         async for chunk in stream:
+            # chunk.model — истинная модель, которую вернул сервер z.ai.
+            if actual_model is None and getattr(chunk, "model", None):
+                actual_model = chunk.model
+                log.info("GLM response: actual model=%s", actual_model)
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta.content
