@@ -171,9 +171,24 @@ async def _safe_edit(message: Message, text: str):
         log.debug("edit_message_text skipped: %s", e)
 
 
+def _mask(value: str) -> str:
+    """Маскированное значение для логов: длина + первые 4/последние 4 символа."""
+    if not value:
+        return f"<empty> (len=0)"
+    if len(value) <= 8:
+        return f"<hidden> (len={len(value)})"
+    return f"{value[:4]}…{value[-4:]} (len={len(value)})"
+
+
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("Bot started. Allowed chat_ids: %s", sorted(ALLOWED_IDS) or "(none)")
+    # Диагностика env: чтобы в логах amvera видеть, какие значения реально подставились.
+    log.info("ENV BOT_TOKEN=%s", _mask(BOT_TOKEN))
+    log.info("ENV GLM_API_KEY=%s", _mask(GLM_API_KEY))
+    log.info("ENV GLM_BASE_URL=%s", GLM_BASE_URL)
+    log.info("ENV GLM_MODEL=%s", DEFAULT_MODEL)
+    log.info("ENV ALLOWED_CHAT_IDS=%s", sorted(ALLOWED_IDS))
     await dp.start_polling(bot)
 
 
