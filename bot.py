@@ -287,26 +287,33 @@ async def _process_message(message: Message, status_msg: Message) -> None:
     """Фоновая обработка: web-decision → поиск → финальный стрим.
 
     Работает вне polling-корутины, под per-chat локом (защита от спама).
+    ВСЁ тело обёрнуто в try/except: фоновая таска падает тихо, и если не
+    обновить плашку, «⏳ Ищу информацию...» зависнет навсегда.
     """
     chat_id = message.chat.id
-    web_on = web_mode[chat_id]
-    model = WEB_MODEL if web_on else user_model.get(chat_id, DEFAULT_MODEL)
+    try:
+        web_on = web_mode[chat_id]
+        model = WEB_MODEL if web_on else user_model.get(chat_id, DEFAULT_MODEL)
 
-    lock = chat_locks[chat_id]
-    async with lock:
-        _ensure_system(chat_id, web_on)
-        history[chat_id].append({"role": "user", "content": message.text})
-        _trim_history(chat_id)
+        lock = chat_locks[chat_id]
+        async with lock:
+            _ensure_system(chat_id, web_on)
+            history[chat_id].append({"role": "user", "content": message.text})
+            _trim_history(chat_id)
 
-        # В web-режиме сначала просим модель решить: нужен ли поиск.
-        if web_on:
-            tool_calls = await _maybe_search(chat_id, model, status_msg)
-            if tool_calls is None:
-                # Уже ответили пользователю в _maybe_search (ошибка tools-не-поддержки).
-                return
+            # В web-режиме сначала просим модель решить: нужен ли поиск.
+            if web_on:
+                tool_calls = await _maybe_search(chat_id, model, status_msg)
+                if tool_calls is None:
+                    # Уже ответили пользователю в _maybe_search.
+                    return
 
-        # Стриминг финального ответа (всегда — и в обычном, и в web-режиме после tool).
-        await _stream_answer(chat_id, model, status_msg)
+            # Стриминг финального ответа (всегда — и в обычном, и в web-режиме после tool).
+            await _stream_answer(chat_id, model, status_msg)
+    except Exception as e:
+        log.exception("Ошибка в фоновой таске: %s", e)
+        # Плашка не должна висеть «⏳ Ищу...» бесконечно — сообщаем об ошибке.
+        await _safe_edit(status_msg, "❌ Произошла ошибка при поиске ответа.")
 
 
 async def _send_status(message: Message, text: str):
@@ -464,10 +471,13 @@ async def _stream_answer(chat_id, model, placeholder) -> None:
     history[chat_id].append({"role": "assistant", "content": full})
 
     chunks = [full[i:i + TG_MSG_LIMIT] for i in range(0, len(full), TG_MSG_LIMIT)]
-    await _safe_edit(placeholder, chunks[0])
+    # Финальный ответ — с fallback по разметке: сырые символы в ответе/ссылках
+    # поиска ломают HTML/Markdown (TelegramBadRequest). Сначала Markdown,
+    # при ошибке — чистый текст без parse_mode.
+    await _safe_edit_fallback(placeholder, chunks[0])
     for c in chunks[1:]:
         try:
-            await bot.send_message(chat_id, c)
+            await _send_fallback(chat_id, c)
         except Exception:
             log.exception("send_message chunk failed")
 
@@ -496,6 +506,32 @@ async def _safe_edit(message: Message, text: str):
                 continue
             log.debug("edit_message_text skipped: %s", e)
             return
+
+
+async def _safe_edit_fallback(message: Message, text: str):
+    """Финальная правка ответа с fallback по разметке.
+
+    Сначала Markdown; если Telegram ругается на разметку (TelegramBadRequest
+    из-за сырых символов/ссылок поиска) — повторяем как чистый текст.
+    """
+    try:
+        await message.edit_text(text, parse_mode="Markdown")
+    except Exception as e:
+        log.debug("Markdown edit failed, retry as plain text: %s", e)
+        try:
+            await message.edit_text(text, parse_mode=None)
+        except Exception as e2:
+            # Не даём плашке зависеть: хотя бы чем-то её обновим.
+            log.debug("plain edit also failed: %s", e2)
+
+
+async def _send_fallback(chat_id: int, text: str):
+    """Досылка доп. чанков с fallback по разметке (Markdown → plain)."""
+    try:
+        await bot.send_message(chat_id, text, parse_mode="Markdown")
+    except Exception as e:
+        log.debug("Markdown send failed, retry as plain text: %s", e)
+        await bot.send_message(chat_id, text, parse_mode=None)
 
 
 def _mask(value: str) -> str:
