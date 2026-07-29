@@ -50,7 +50,11 @@ TG_MSG_LIMIT = 4000       # запас от лимита Telegram в 4096
 UPDATE_INTERVAL = 1.0     # сек между правками сообщения при стриминге
 WEB_RESULTS = 5           # сколько результатов поиска отдавать в модель
 WEB_SNIPPET = 300         # макс. длина сниппета в символах
-WEB_TIMEOUT = 5.0         # сек — таймаут на запрос к DuckDuckGo
+WEB_TIMEOUT = 5.0         # сек — жёсткий таймаут на весь веб-поиск
+# ddgs v9 — метапоиск: при backend='auto' перебирает до 7 движков, часть падает
+# (DuckDuckGo/Wikipedia/Google часто отдают DDGSException), и в сумме поиск длится
+# 30-60с, что рвёт keep-alive Telegram. Фиксируем один стабильный быстрый бэкенд.
+WEB_BACKEND = os.environ.get("WEB_BACKEND", "yandex")
 
 def _today_str() -> str:
     """Текущая дата с сервера (формат: 28.07.2026 (Monday))."""
@@ -126,6 +130,10 @@ history: dict[int, list[dict]] = defaultdict(list)
 user_model: dict[int, str] = {}
 # chat_id -> включён ли web-режим
 web_mode: dict[int, bool] = defaultdict(bool)
+# chat_id -> блокировка, чтобы не гонять параллельные ответы в одном чате
+chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+# Ссылки на фоновые задачи (чтобы GC не убил). Чистятся в done-callback.
+_bg_tasks: set = set()
 
 ALLOWED_FILTER = F.chat.id.in_(ALLOWED_IDS)
 
@@ -145,25 +153,25 @@ def _ensure_system(chat_id: int, web_on: bool) -> None:
 
 
 def _ddg_search(query: str) -> str:
-    """Синхронный поиск через DuckDuckGo. Возвращает текст для tool-сообщения.
+    """Синхронный поиск. Возвращает текст для tool-сообщения.
 
     Вызывается через asyncio.to_thread, чтобы не блокировать event loop.
-    ВАЖНО: backend='duckduckgo' — единственный движок. Без него ddgs (метапоиск)
-    гоняет цепочку из 7 бэкендов (Wikipedia/Grokipedia/Startpage/Mojeek/Google/
-    Yandex/Brave), что даёт задержки 60-70с и роняет Telegram по таймауту.
-    Жёсткий timeout=5 сек ограничивает весь поиск.
+    Один движок (WEB_BACKEND, по умолчанию 'yandex'): ddgs v9 — это метапоиск,
+    при backend='auto' он перебирает до 7 движков; упавшие (DuckDuckGo/Wikipedia/
+    Google часто отдают DDGSException) заставляют идти дальше, поиск растягивается
+    на 30-60с и рвёт keep-alive Telegram. Жёсткий timeout=WEB_TIMEOUT.
     """
     try:
         with DDGS(timeout=WEB_TIMEOUT) as ddgs:
             results = list(
                 ddgs.text(
                     query,
-                    backend="duckduckgo",
+                    backend=WEB_BACKEND,
                     max_results=WEB_RESULTS,
                 )
             )
     except Exception as e:
-        log.warning("web_search failed: %s", e)
+        log.warning("web_search failed (backend=%s): %s", WEB_BACKEND, e)
         return f"Поиск недоступен: {e}"
 
     if not results:
@@ -181,15 +189,19 @@ def _ddg_search(query: str) -> str:
 
 
 async def _web_search(query: str) -> str:
-    """Асинхронная обёртка: синхронный поиск в фоновом потоке, не блокирует loop.
+    """Веб-поиск в фоновом потоке с жёстким таймаутом.
 
-    asyncio.to_thread гарантирует, что блокирующий I/O DuckDuckGo уходит из
-    основного потока event loop. Таймаут — через asyncio.wait_for.
+    asyncio.to_thread — блокирующий I/O уходит из event loop.
+    asyncio.wait_for(timeout=WEB_TIMEOUT) — если поиск не уложился, fallback.
     """
-    return await asyncio.wait_for(
-        asyncio.to_thread(_ddg_search, query),
-        timeout=WEB_TIMEOUT,
-    )
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_ddg_search, query),
+            timeout=WEB_TIMEOUT,
+        )
+    except (asyncio.TimeoutError, Exception) as e:
+        log.error("Search failed or timed out: %s", e)
+        return "Информация из поиска недоступна."
 
 
 @dp.message(ALLOWED_FILTER, Command("start"))
@@ -255,30 +267,60 @@ async def cmd_model(message: Message):
 
 @dp.message(ALLOWED_FILTER, F.text)
 async def handle_text(message: Message):
+    """Первая (и единственная быстроя) операция в polling-корутине.
+
+    Шлём плашку и сразу возвращаем управление — вся тяжёлая работа (GLM,
+    веб-поиск, стриминг) уходит в фоновую задачу. Пока она бежит, aiogram
+    свободен отвечать на keep-alive Telegram, соединение не рвётся.
+    """
     chat_id = message.chat.id
     web_on = web_mode[chat_id]
-    # В web-режиме используем WEB_MODEL (подтверждённый function calling),
-    # иначе — выбранную пользователем модель чата.
+    # Плашка — в САМОМ НАЧАЛЕ, до любых вызовов GLM и веб-поиска.
+    status_msg = await _send_status(message, "⏳ Ищу информацию..." if web_on else "…")
+    # Тяжёлая обработка — в фон, polling не блокируется.
+    task = asyncio.create_task(_process_message(message, status_msg))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def _process_message(message: Message, status_msg: Message) -> None:
+    """Фоновая обработка: web-decision → поиск → финальный стрим.
+
+    Работает вне polling-корутины, под per-chat локом (защита от спама).
+    """
+    chat_id = message.chat.id
+    web_on = web_mode[chat_id]
     model = WEB_MODEL if web_on else user_model.get(chat_id, DEFAULT_MODEL)
 
-    _ensure_system(chat_id, web_on)
-    history[chat_id].append({"role": "user", "content": message.text})
-    _trim_history(chat_id)
+    lock = chat_locks[chat_id]
+    async with lock:
+        _ensure_system(chat_id, web_on)
+        history[chat_id].append({"role": "user", "content": message.text})
+        _trim_history(chat_id)
 
-    # Плашка ожидания — в САМОМ НАЧАЛЕ, до любых вызовов GLM и веб-поиска.
-    # Позже она редактируется: на «🔍 Ищу...» во время поиска и на финальный
-    # ответ через edit_text в _stream_answer.
-    placeholder = await message.answer("⏳ Ищу информацию..." if web_on else "…")
+        # В web-режиме сначала просим модель решить: нужен ли поиск.
+        if web_on:
+            tool_calls = await _maybe_search(chat_id, model, status_msg)
+            if tool_calls is None:
+                # Уже ответили пользователю в _maybe_search (ошибка tools-не-поддержки).
+                return
 
-    # В web-режиме сначала просим модель решить: нужен ли поиск.
-    if web_on:
-        tool_calls = await _maybe_search(chat_id, model, placeholder)
-        if tool_calls is None:
-            # Уже ответили пользователю в _maybe_search (ошибка tools-не-поддержки).
-            return
+        # Стриминг финального ответа (всегда — и в обычном, и в web-режиме после tool).
+        await _stream_answer(chat_id, model, status_msg)
 
-    # Стриминг финального ответа (всегда — и в обычном, и в web-режиме после tool).
-    await _stream_answer(chat_id, model, placeholder)
+
+async def _send_status(message: Message, text: str):
+    """Шлём плашку с ретраями: кратковременный разрыв connection pool к Telegram
+    не должен валить весь апдейт."""
+    last = None
+    for attempt in range(3):
+        try:
+            return await message.answer(text)
+        except Exception as e:
+            last = e
+            log.warning("answer attempt %d failed: %s", attempt + 1, e)
+            await asyncio.sleep(0.5)
+    raise last
 
 
 def _trim_history(chat_id: int) -> None:
@@ -431,18 +473,29 @@ async def _stream_answer(chat_id, model, placeholder) -> None:
 
 
 async def _safe_edit(message: Message, text: str):
-    """Редактируем сообщение, игнорируя 'not modified' и rate-limit."""
-    try:
-        await bot.edit_message_text(
-            text=text,
-            chat_id=message.chat.id,
-            message_id=message.message_id,
-        )
-    except Exception as e:
-        msg = str(e).lower()
-        if "not modified" in msg or "too many requests" in msg:
+    """Редактируем сообщение, игнорируя 'not modified' и rate-limit.
+
+    На сетевых ошибках (connection pool к Telegram порвался) — пара ретраев
+    с короткой паузой: разрыв обычно кратковременный.
+    """
+    for attempt in range(3):
+        try:
+            await bot.edit_message_text(
+                text=text,
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
             return
-        log.debug("edit_message_text skipped: %s", e)
+        except Exception as e:
+            msg = str(e).lower()
+            if "not modified" in msg or "too many requests" in msg:
+                return
+            if attempt < 2 and ("timeout" in msg or "network" in msg or "connection" in msg):
+                log.warning("edit retry %d: %s", attempt + 1, e)
+                await asyncio.sleep(0.5)
+                continue
+            log.debug("edit_message_text skipped: %s", e)
+            return
 
 
 def _mask(value: str) -> str:
