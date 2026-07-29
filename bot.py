@@ -148,10 +148,20 @@ def _ddg_search(query: str) -> str:
     """Синхронный поиск через DuckDuckGo. Возвращает текст для tool-сообщения.
 
     Вызывается через asyncio.to_thread, чтобы не блокировать event loop.
+    ВАЖНО: backend='duckduckgo' — единственный движок. Без него ddgs (метапоиск)
+    гоняет цепочку из 7 бэкендов (Wikipedia/Grokipedia/Startpage/Mojeek/Google/
+    Yandex/Brave), что даёт задержки 60-70с и роняет Telegram по таймауту.
+    Жёсткий timeout=5 сек ограничивает весь поиск.
     """
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=WEB_RESULTS))
+        with DDGS(timeout=WEB_TIMEOUT) as ddgs:
+            results = list(
+                ddgs.text(
+                    query,
+                    backend="duckduckgo",
+                    max_results=WEB_RESULTS,
+                )
+            )
     except Exception as e:
         log.warning("web_search failed: %s", e)
         return f"Поиск недоступен: {e}"
@@ -255,7 +265,10 @@ async def handle_text(message: Message):
     history[chat_id].append({"role": "user", "content": message.text})
     _trim_history(chat_id)
 
-    placeholder = await message.answer("…")
+    # Плашка ожидания — в САМОМ НАЧАЛЕ, до любых вызовов GLM и веб-поиска.
+    # Позже она редактируется: на «🔍 Ищу...» во время поиска и на финальный
+    # ответ через edit_text в _stream_answer.
+    placeholder = await message.answer("⏳ Ищу информацию..." if web_on else "…")
 
     # В web-режиме сначала просим модель решить: нужен ли поиск.
     if web_on:
