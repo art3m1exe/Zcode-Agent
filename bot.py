@@ -147,7 +147,7 @@ def _ensure_system(chat_id: int, web_on: bool) -> None:
 def _ddg_search(query: str) -> str:
     """Синхронный поиск через DuckDuckGo. Возвращает текст для tool-сообщения.
 
-    Запускается в потоке (run_in_executor), чтобы не блокировать event loop.
+    Вызывается через asyncio.to_thread, чтобы не блокировать event loop.
     """
     try:
         with DDGS() as ddgs:
@@ -171,10 +171,13 @@ def _ddg_search(query: str) -> str:
 
 
 async def _web_search(query: str) -> str:
-    """Асинхронная обёртка над синхронным поиском с таймаутом."""
-    loop = asyncio.get_running_loop()
+    """Асинхронная обёртка: синхронный поиск в фоновом потоке, не блокирует loop.
+
+    asyncio.to_thread гарантирует, что блокирующий I/O DuckDuckGo уходит из
+    основного потока event loop. Таймаут — через asyncio.wait_for.
+    """
     return await asyncio.wait_for(
-        loop.run_in_executor(None, _ddg_search, query),
+        asyncio.to_thread(_ddg_search, query),
         timeout=WEB_TIMEOUT,
     )
 
@@ -341,6 +344,9 @@ async def _maybe_search(chat_id, model, placeholder) -> "list | None":
             args = {}
         query = (args.get("query") or "").strip() or message_text(chat_id)
         await _safe_edit(placeholder, f"🔍 Ищу: {query[:100]}…")
+        # Явно отдаём управление в event loop, чтобы правка статуса улетела
+        # в Telegram ДО запуска долгого поиска в фоновом потоке.
+        await asyncio.sleep(0)
         result = await _web_search(query)
         history[chat_id].append(
             {
