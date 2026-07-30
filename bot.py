@@ -41,7 +41,7 @@ DEFAULT_MODEL = os.environ.get("GLM_MODEL", "glm-5.2")
 WEB_MODEL = os.environ.get("WEB_MODEL", "glm-4.6")
 # Ключ Яндекс.Расписаний (https://yandex.ru/dev/rasp). Без него интеграция
 # с реальными расписаниями поездов выключена — бот честно об этом скажет.
-YANDEX_RASP_KEY = os.environ.get("YANDEX_RASP_KEY", "")
+YANDEX_RASP_KEY = os.getenv("YANDEX_RASP_KEY", "")
 YANDEX_RASP_URL = "https://api.rasp.yandex.net/v3.0/search/"
 
 ALLOWED_IDS = {
@@ -968,6 +968,7 @@ async def main():
     log.info("ENV GLM_BASE_URL=%s", GLM_BASE_URL)
     log.info("ENV GLM_MODEL=%s", DEFAULT_MODEL)
     log.info("ENV WEB_MODEL=%s", WEB_MODEL)
+    log.info("ENV YANDEX_RASP_KEY=%s", "set" if YANDEX_RASP_KEY else "not set")
     log.info("ENV ALLOWED_CHAT_IDS=%s", sorted(ALLOWED_IDS))
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
