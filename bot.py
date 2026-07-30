@@ -39,6 +39,10 @@ GLM_BASE_URL = os.environ.get("GLM_BASE_URL", "https://api.z.ai/api/coding/paas/
 DEFAULT_MODEL = os.environ.get("GLM_MODEL", "glm-5.2")
 # Модель для web-режима: glm-4.6 — подтверждённый function calling, дешевле.
 WEB_MODEL = os.environ.get("WEB_MODEL", "glm-4.6")
+# Ключ Яндекс.Расписаний (https://yandex.ru/dev/rasp). Без него интеграция
+# с реальными расписаниями поездов выключена — бот честно об этом скажет.
+YANDEX_RASP_KEY = os.environ.get("YANDEX_RASP_KEY", "")
+YANDEX_RASP_URL = "https://api.rasp.yandex.net/v3.0/search/"
 
 ALLOWED_IDS = {
     int(x)
@@ -95,14 +99,16 @@ def build_system_prompt(web_on: bool) -> str:
             "интернету или что твои знания ограничены каким-либо годом: "
             "всегда сначала ищи, потом отвечай. "
             "При ответе на запросы о расписаниях, билетах и мероприятиях ты "
-            "ОБЯЗАН указывать точные данные из найденного текста: номера "
-            "поездов/рейсов, точное время отправления и прибытия, станции, "
-            "цены. Никогда не отправляй пользователя искать информацию "
-            "самостоятельно, если данные можно извлечь из поиска. "
-            "Если подробного расписания на конкретную дату нет в поиске, "
-            "напиши доступные базовые поезда на данном маршруте (например, "
-            "ежедневный «Ласточка», фирменные/скорые поезда) и "
-            "ориентировочное время в пути — не отказывай в ответе. "
+            "ОБЯЗАН указывать ТОЛЬКО точные данные из найденного текста: "
+            "номера поездов/рейсов, точное время отправления и прибытия, "
+            "станции, цены — и только если они реально есть в результатах "
+            "поиска. КРИТИЧЕСКИ ВАЖНО: если у тебя нет точно распарсенных "
+            "данных с номерами поездов и временем, прямо пиши, что "
+            "динамическое расписание доступно только на официальных сайтах "
+            "(Яндекс.Расписания, Tutu, РЖД), и НИКОГДА не выдумывай часы "
+            "отправления/прибытия, номера рейсов или цены. Лучше честно "
+            "сказать «точное время не нашлось» и дать ссылки, чем назвать "
+            "придуманное время. "
             "НИКОГДА не генерируй теги <tool_call> или XML-структуры в тексте "
             "ответа: для вызова функции используй только штатный механизм "
             "function-calling. В тексте ответа для пользователя не должно быть "
@@ -176,6 +182,142 @@ def _ensure_system(chat_id: int, web_on: bool) -> None:
         msgs[0]["content"] = prompt
     else:
         msgs.insert(0, {"role": "system", "content": prompt})
+
+
+# Коды станций Яндекс.Расписаний для популярных городов России.
+# Пополнить при необходимости через /v3.0/suggest/.
+YANDEX_STATIONS = {
+    "москва": "c213", "мск": "c213", "moscow": "c213",
+    "санкт-петербург": "c2", "спб": "c2", "питер": "c2", "петербург": "c2",
+    "санкт петербург": "c2",
+    "новосибирск": "c54",
+    "екатеринбург": "c207",
+    "нижний новгород": "c35",
+    "казань": "c86",
+    "самара": "c51",
+    "омск": "c292",
+    "челябинск": "c208",
+    "ростов-на-дону": "c40", "ростов на дону": "c40", "ростов": "c40",
+    "уфа": "c294",
+    "красноярск": "c290",
+    "пермь": "c210",
+    "волгоград": "c194",
+    "воронеж": "c61",
+    "краснодар": "c270",
+    "сочи": "c142",
+    "тюмень": "c296",
+    "ярославль": "c108",
+    "мурманск": "c282",
+    "кондопога": "c3453",
+    "петрозаводск": "c3496",
+    "тверь": "c78",
+    "балашиха": "c5888465",
+    "подольск": "c5874515",
+}
+
+
+def _find_station_codes(text: str) -> tuple[str, str] | None:
+    """Пытается найти в тексте запроса пару городов → коды станций.
+
+    Возвращает (from_code, to_code) или None. Соединитель ('—', '-', 'до',
+    'в', 'из') необязателен: берём первые два известных города по порядку.
+    Учитывает падежи: «Москвы», «Питере» сводятся к словарной форме через
+    сравнение слова с началом словарной формы (startswitch по корню).
+    """
+    t = (text or "").lower()
+    t = t.replace("—", " ").replace("–", " ")
+    # Токенизируем по не-буквам, сохраняя порядок и позицию.
+    tokens = [(m.start(), m.group()) for m in re.finditer(r"[а-яёa-z]+", t)]
+    found = []  # (позиция, код)
+    for pos, tok in tokens:
+        for name, code in YANDEX_STATIONS.items():
+            # Точное совпадение либо совпадение по корню (минимум 4 символа),
+            # чтобы покрывать падежи: Москва/Москвы/Москве, Казань/Казани.
+            if tok == name or (
+                len(name) >= 4
+                and len(tok) >= 4
+                and (
+                    tok.startswith(name[:4])
+                    or name.startswith(tok[:4])
+                )
+            ):
+                found.append((pos, code))
+                break
+    if len(found) < 2:
+        return None
+    found.sort()  # по позиции в тексте
+    # Берём два разных кода (город может встретиться дважды).
+    codes = []
+    for _, code in found:
+        if code not in codes:
+            codes.append(code)
+        if len(codes) == 2:
+            break
+    return (codes[0], codes[1]) if len(codes) == 2 else None
+
+
+def _format_yandex_rasp(data: dict) -> str:
+    """Превращает JSON ответ Яндекс.Расписаний в человекочитаемый текст."""
+    segments = data.get("segments") or []
+    if not segments:
+        return ""
+    lines = []
+    for s in segments[:8]:  # первые 8 рейсов, чтобы не раздувать контекст
+        thread = s.get("thread", {}) or {}
+        dep = (s.get("departure") or "")[11:16]  # HH:MM
+        arr = (s.get("arrival") or "")[11:16]
+        number = thread.get("number", "")
+        title = thread.get("title", "")
+        ttype = {"train": "поезд", "suburban": "электричка",
+                 "bus": "автобус", "plane": "самолёт"}.get(
+            thread.get("transport_type"), thread.get("transport_type", ""))
+        dur = s.get("duration")
+        dur_h = f"{dur // 3600:.0f}ч {dur % 3600 // 60:02d}м" if dur else ""
+        price = ""
+        prices = s.get("prices") or {}
+        if isinstance(prices, dict):
+            pwhole = prices.get("whole") or {}
+            if isinstance(pwhole, dict) and pwhole.get("price"):
+                price = f", от {pwhole['price']}₽"
+        lines.append(
+            f"• {ttype} {number} {title}: отпр {dep} → приб {arr}"
+            f"{(' (' + dur_h + ')') if dur_h else ''}{price}"
+        )
+    return "Реальное расписание (Яндекс.Расписания API):\n" + "\n".join(lines)
+
+
+async def _yandex_rasp_search(text: str) -> str:
+    """Прямой запрос к Яндекс.Расписаниям для поездов между станциями.
+
+    Возвращает '' если интеграция выключена (нет ключа), не распознаны города
+    или нет рейсов. Все ошибки тихие — вызов идёт из _web_search с fallback.
+    """
+    if not YANDEX_RASP_KEY:
+        return ""
+    codes = _find_station_codes(text)
+    if not codes:
+        return ""
+    from_code, to_code = codes
+    params = {
+        "apikey": YANDEX_RASP_KEY,
+        "from": from_code,
+        "to": to_code,
+        "format": "json",
+        "lang": "ru_RU",
+        "transport_types": "train,suburban",
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=WEB_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(YANDEX_RASP_URL, params=params) as resp:
+                if resp.status != 200:
+                    log.debug("yandex rasp status %s", resp.status)
+                    return ""
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        log.debug("yandex rasp failed: %s", e)
+        return ""
+    return _format_yandex_rasp(data)
 
 
 def _ddg_search(query: str) -> list[dict]:
@@ -295,18 +437,32 @@ def _answer_from_snippets(query: str, search_result: str) -> str:
 
 
 async def _web_search(query: str) -> str:
-    """Веб-поиск + глубокий парсинг релевантных страниц, с жёсткими таймаутами.
+    """Веб-поиск + (опц.) реальное расписание + глубокий парсинг.
 
-    1) Упрощаем запрос (_simplify_query): убираем даты в кавычках и лишние
-       слова — иначе DDG ничего не находит по перегруженному запросу.
+    Порядок источников (каждый факультативен, на сбое — fallback дальше):
+    0) Яндекс.Расписания API: если есть ключ и распознались два города —
+       получаем точные поезда/время/цены. Это первичный источник для расписаний.
+    1) Упрощаем запрос (_simplify_query): убираем даты в кавычках и лишние слова.
     2) ddgs в фоне (to_thread) под wait_for(WEB_TIMEOUT).
     3) Если среди ссылок есть сайты расписаний/билетов (WEB_DEEP_HOSTS),
-       тянем и парсим первую такую страницу — в ней точные время/номера.
-       Парсинг факультативен: при 403/404/пустоте молча падаем на сниппеты.
+       тянем и парсим первую такую страницу.
     Все сетевые операции — неблокирующие.
     """
+    # 0) Реальное расписание из Яндекс.Расписаний (если настроен ключ).
+    yandex_text = ""
+    try:
+        yandex_text = await asyncio.wait_for(
+            _yandex_rasp_search(query), timeout=WEB_TIMEOUT
+        )
+    except (asyncio.TimeoutError, Exception) as e:
+        log.debug("yandex rasp timed out: %s", e)
+    if yandex_text:
+        log.info("web_search: yandex rasp data found (%d chars)", len(yandex_text))
+
+    # 1-3) Обычный веб-поиск + глубокий парсинг.
     simple = _simplify_query(query)
-    log.info("web_search: original=%r simplified=%r", query, simple)
+    log.info("web_search: original=%r simplified=%r yandex=%s",
+             query, simple, "yes" if yandex_text else "no")
     try:
         results = await asyncio.wait_for(
             asyncio.to_thread(_ddg_search, simple or query),
@@ -314,7 +470,8 @@ async def _web_search(query: str) -> str:
         )
     except (asyncio.TimeoutError, Exception) as e:
         log.error("Search failed or timed out: %s", e)
-        return "Информация из поиска недоступна."
+        # Если есть данные Яндекс.Расписаний — отдаём хотя бы их.
+        return yandex_text or "Информация из поиска недоступна."
 
     # Если упрощённый запрос ничего не дал — пробуем исходный (на всякий).
     if not results and simple and simple != query:
@@ -326,8 +483,28 @@ async def _web_search(query: str) -> str:
         except (asyncio.TimeoutError, Exception):
             results = []
 
-    if not results:
-        return "Информация из поиска недоступна."
+    # Глубокий парсинг: первая релевантная страница из разрешённых хостов.
+    deep: dict[str, str] = {}
+    for r in results:
+        if _is_deep_host(r["url"]):
+            try:
+                page_text = await asyncio.wait_for(
+                    _fetch_page_text(r["url"]),
+                    timeout=WEB_FETCH_TIMEOUT + 1.0,
+                )
+            except (asyncio.TimeoutError, Exception) as e:
+                log.debug("deep fetch timed out %s: %s", r["url"], e)
+                page_text = ""
+            if page_text:
+                deep[r["url"]] = page_text
+                break  # достаточно одной страницы с точными данными
+
+    snippets = _format_search_results(results, deep) if results else ""
+    if yandex_text and snippets:
+        return yandex_text + "\n\n---\n\nДополнительно из веб-поиска:\n" + snippets
+    if yandex_text:
+        return yandex_text
+    return snippets or "Информация из поиска недоступна."
 
     # Глубокий парсинг: первая релевантная страница из разрешённых хостов.
     deep: dict[str, str] = {}
