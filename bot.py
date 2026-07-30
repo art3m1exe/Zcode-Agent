@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -80,7 +81,11 @@ def build_system_prompt(web_on: bool) -> str:
             "использовать web_search и отвечать на основе найденного, "
             "указывая источники. НИКОГДА не пиши, что у тебя нет доступа к "
             "интернету или что твои знания ограничены каким-либо годом: "
-            "всегда сначала ищи, потом отвечай."
+            "всегда сначала ищи, потом отвечай. "
+            "НИКОГДА не генерируй теги <tool_call> или XML-структуры в тексте "
+            "ответа: для вызова функции используй только штатный механизм "
+            "function-calling. В тексте ответа для пользователя не должно быть "
+            "никаких <tool_call>, <arg_key>, <arg_value> и подобных тегов."
         )
     return base + (
         " Отвечай из своих знаний. Если вопрос требует свежих данных, "
@@ -431,11 +436,21 @@ def message_text(chat_id: int) -> str:
     return ""
 
 
-async def _stream_answer(chat_id, model, placeholder) -> None:
-    """Стримит финальный ответ модели и обновляет сообщение в Telegram."""
+async def _stream_answer(chat_id, model, placeholder, _tool_attempts: int = 0) -> None:
+    """Стримит финальный ответ модели и обновляет сообщение в Telegram.
+
+    Если модель (glm-4.5-flash иногда так делает) проигнорировала штатный
+    function-calling и выписала вызов tool прямо текстом (<tool_call>...),
+    перехватываем: парсим query из <arg_value>, выполняем веб-поиск, кладём
+    результат в историю и перезапрашиваем модель — уже без tool-тегов.
+    _tool_attempts ограничивает число таких перехватов (защита от зацикливания).
+    """
+    MAX_TOOL_ATTEMPTS = 2
     buf = ""
     last_update = time.monotonic()
     actual_model = None
+    started_tool_tag = False  # True, если в потоке замечен '<tool_call>' —
+                              # такие куски юзеру не показываем.
 
     try:
         log.info("GLM request: requested model=%s", model)
@@ -455,10 +470,15 @@ async def _stream_answer(chat_id, model, placeholder) -> None:
             if not delta:
                 continue
             buf += delta
-            now = time.monotonic()
-            if now - last_update >= UPDATE_INTERVAL:
-                await _safe_edit(placeholder, buf[:TG_MSG_LIMIT])
-                last_update = now
+            # Появился текстовый tool_call — не показываем его юзеру, копим в buf.
+            if "<tool_call>" in buf:
+                started_tool_tag = True
+                continue
+            if not started_tool_tag:
+                now = time.monotonic()
+                if now - last_update >= UPDATE_INTERVAL:
+                    await _safe_edit(placeholder, buf[:TG_MSG_LIMIT])
+                    last_update = now
     except Exception as e:
         log.exception("GLM error")
         # Ответа нет — убираем пользовательское сообщение из истории.
@@ -468,6 +488,37 @@ async def _stream_answer(chat_id, model, placeholder) -> None:
         return
 
     full = buf or "(пустой ответ)"
+
+    # Перехват текстового tool_call: модель не использовала function-calling.
+    query = _parse_text_tool_call(full)
+    if query and _tool_attempts < MAX_TOOL_ATTEMPTS:
+        log.info("text tool_call intercepted (attempt %d), query=%r",
+                 _tool_attempts + 1, query)
+        await _safe_edit(placeholder, f"🔍 Ищу: {query[:100]}…")
+        result = await _web_search(query)
+        history[chat_id].append({"role": "assistant", "content": full})
+        history[chat_id].append(
+            {
+                "role": "user",
+                "content": (
+                    f"Результаты веб-поиска по запросу «{query}»:\n{result}\n\n"
+                    "На основе этих результатов дай пользователю краткий "
+                    "человеческий ответ. НЕ используй теги <tool_call>."
+                ),
+            }
+        )
+        # Рекурсивный вызов — теперь модель должна ответить нормально.
+        await _stream_answer(chat_id, model, placeholder, _tool_attempts + 1)
+        return
+    if query:
+        # Лимит перехватов исчерпан — модель упорно шлёт теги. Чистим и отдаём
+        # как есть, вырезав сами теги, чтобы не пугать юзера разметкой.
+        log.warning("tool_call attempts exhausted, stripping tags")
+        full = re.sub(r"<tool_call>.*?</tool_call>", "", full, flags=re.DOTALL).strip()
+        if not full:
+            full = "Не удалось получить ответ."
+
+    # Чистый человеческий ответ — обычный путь.
     history[chat_id].append({"role": "assistant", "content": full})
 
     chunks = [full[i:i + TG_MSG_LIMIT] for i in range(0, len(full), TG_MSG_LIMIT)]
@@ -480,6 +531,21 @@ async def _stream_answer(chat_id, model, placeholder) -> None:
             await _send_fallback(chat_id, c)
         except Exception:
             log.exception("send_message chunk failed")
+
+
+def _parse_text_tool_call(text: str) -> str:
+    """Достаёт запрос из текстового <tool_call>...<arg_value>query</arg_value>.
+
+    Возвращает '' если это не текстовый вызов web_search.
+    """
+    if "<tool_call>" not in text:
+        return ""
+    # Сначала ищем web_search по имени функции, потом arg_value рядом.
+    has_web = "web_search" in text.lower()
+    m = re.search(r"<arg_value>(.*?)</arg_value>", text, re.DOTALL | re.IGNORECASE)
+    if has_web and m:
+        return m.group(1).strip()
+    return ""
 
 
 async def _safe_edit(message: Message, text: str):
