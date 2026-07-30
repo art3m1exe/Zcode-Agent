@@ -12,11 +12,13 @@ import time
 from collections import defaultdict
 from datetime import datetime
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
+from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 
 try:
@@ -52,6 +54,16 @@ UPDATE_INTERVAL = 1.0     # сек между правками сообщени�
 WEB_RESULTS = 5           # сколько результатов поиска отдавать в модель
 WEB_SNIPPET = 300         # макс. длина сниппета в символах
 WEB_TIMEOUT = 5.0         # сек — жёсткий таймаут на весь веб-поиск
+WEB_FETCH_TIMEOUT = 4.0   # сек — таймаут на скачивание страницы для глубокого парсинга
+WEB_FETCH_CHARS = 2000    # макс. символов текста, извлекаемого со страницы
+# Хосты, с которых имеет смысл тянуть полный текст (расписания/билеты/события):
+# сниппеты поисковика там слишком скудные, нужны точные время/номера.
+WEB_DEEP_HOSTS = (
+    "rasp.yandex.ru", "tutu.ru", "rzd.ru", "pass.rzd.ru",
+    "busfor.ru", "aviasales.ru", "flyone", "aeroport",
+    "kassir.ru", "radario", "timepad.ru", "qtickets",
+    "onely", "ponominalu", "spb.kassir", "msk.kassir",
+)
 # ddgs v9 — метапоиск: при backend='auto' перебирает до 7 движков, часть падает
 # (DuckDuckGo/Wikipedia/Google часто отдают DDGSException), и в сумме поиск длится
 # 30-60с, что рвёт keep-alive Telegram. Фиксируем один стабильный быстрый бэкенд.
@@ -82,6 +94,11 @@ def build_system_prompt(web_on: bool) -> str:
             "указывая источники. НИКОГДА не пиши, что у тебя нет доступа к "
             "интернету или что твои знания ограничены каким-либо годом: "
             "всегда сначала ищи, потом отвечай. "
+            "При ответе на запросы о расписаниях, билетах и мероприятиях ты "
+            "ОБЯЗАН указывать точные данные из найденного текста: номера "
+            "поездов/рейсов, точное время отправления и прибытия, станции, "
+            "цены. Никогда не отправляй пользователя искать информацию "
+            "самостоятельно, если данные можно извлечь из поиска. "
             "НИКОГДА не генерируй теги <tool_call> или XML-структуры в тексте "
             "ответа: для вызова функции используй только штатный механизм "
             "function-calling. В тексте ответа для пользователя не должно быть "
@@ -157,8 +174,8 @@ def _ensure_system(chat_id: int, web_on: bool) -> None:
         msgs.insert(0, {"role": "system", "content": prompt})
 
 
-def _ddg_search(query: str) -> str:
-    """Синхронный поиск. Возвращает текст для tool-сообщения.
+def _ddg_search(query: str) -> list[dict]:
+    """Синхронный поиск. Возвращает список результатов [{title, snippet, url}].
 
     Вызывается через asyncio.to_thread, чтобы не блокировать event loop.
     Один движок (WEB_BACKEND, по умолчанию 'yandex'): ddgs v9 — это метапоиск,
@@ -168,7 +185,7 @@ def _ddg_search(query: str) -> str:
     """
     try:
         with DDGS(timeout=WEB_TIMEOUT) as ddgs:
-            results = list(
+            raw = list(
                 ddgs.text(
                     query,
                     backend=WEB_BACKEND,
@@ -177,36 +194,120 @@ def _ddg_search(query: str) -> str:
             )
     except Exception as e:
         log.warning("web_search failed (backend=%s): %s", WEB_BACKEND, e)
-        return f"Поиск недоступен: {e}"
+        return []
 
-    if not results:
-        return "По вашему запросу ничего не найдено."
-
-    lines = []
-    for i, r in enumerate(results, 1):
-        title = (r.get("title") or "").strip()
-        snippet = (r.get("body") or r.get("snippet") or "").strip()
+    results = []
+    for r in raw:
         url = (r.get("href") or r.get("url") or "").strip()
+        snippet = (r.get("body") or r.get("snippet") or "").strip()
         if len(snippet) > WEB_SNIPPET:
             snippet = snippet[:WEB_SNIPPET].rstrip() + "…"
-        lines.append(f"{i}. {title}\n{snippet}\n{url}")
+        results.append(
+            {
+                "title": (r.get("title") or "").strip(),
+                "snippet": snippet,
+                "url": url,
+            }
+        )
+    return results
+
+
+def _is_deep_host(url: str) -> bool:
+    """Стоит ли тянуть полный текст с этой страницы (расписания/билеты)."""
+    u = (url or "").lower()
+    return any(h in u for h in WEB_DEEP_HOSTS)
+
+
+async def _fetch_page_text(url: str) -> str:
+    """Скачивает страницу и извлекает видимый текст (BeautifulSoup).
+
+    Возвращает '' при любой ошибке/таймауте — глубокий парсинг факультативен.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        ),
+        "Accept-Language": "ru-Ru,ru;q=0.9",
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=WEB_FETCH_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return ""
+                # Решаем кодировку: если сервер не дал, пробуем utf-8 затем cp1251.
+                raw = await resp.read()
+                enc = resp.charset or "utf-8"
+                try:
+                    html = raw.decode(enc, errors="ignore")
+                except (LookupError, UnicodeDecodeError):
+                    html = raw.decode("utf-8", errors="ignore")
+        soup = BeautifulSoup(html, "lxml")
+        # Убираем шум.
+        for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n")
+        # Нормализуем: убираем длинные серии пробелов/пустых строк.
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        text = "\n".join(lines)
+        return text[:WEB_FETCH_CHARS]
+    except Exception as e:
+        log.debug("deep fetch failed %s: %s", url, e)
+        return ""
+
+
+def _format_search_results(results: list[dict], deep: dict[str, str]) -> str:
+    """Собирает итоговый текст для модели: сниппеты + (опц.) полный текст страницы."""
+    if not results:
+        return "По вашему запросу ничего не найдено."
+    lines = []
+    for i, r in enumerate(results, 1):
+        block = f"{i}. {r['title']}\n{r['snippet']}\n{r['url']}"
+        page_text = deep.get(r["url"])
+        if page_text:
+            block += f"\n[ТЕКСТ СТРАНИЦЫ]:\n{page_text}"
+        lines.append(block)
     return "\n\n".join(lines)
 
 
 async def _web_search(query: str) -> str:
-    """Веб-поиск в фоновом потоке с жёстким таймаутом.
+    """Веб-поиск + глубокий парсинг релевантных страниц, с жёсткими таймаутами.
 
-    asyncio.to_thread — блокирующий I/O уходит из event loop.
-    asyncio.wait_for(timeout=WEB_TIMEOUT) — если поиск не уложился, fallback.
+    1) ddgs в фоне (to_thread) под wait_for(WEB_TIMEOUT).
+    2) Если среди ссылок есть сайты расписаний/билетов (WEB_DEEP_HOSTS),
+       тянем и парсим первую такую страницу — в ней точные время/номера.
+    Все сетевые операции — неблокирующие; на любом сбое fallback на сниппеты.
     """
     try:
-        return await asyncio.wait_for(
+        results = await asyncio.wait_for(
             asyncio.to_thread(_ddg_search, query),
             timeout=WEB_TIMEOUT,
         )
     except (asyncio.TimeoutError, Exception) as e:
         log.error("Search failed or timed out: %s", e)
         return "Информация из поиска недоступна."
+
+    if not results:
+        return "Информация из поиска недоступна."
+
+    # Глубокий парсинг: первая релевантная страница из разрешённых хостов.
+    deep: dict[str, str] = {}
+    for r in results:
+        if _is_deep_host(r["url"]):
+            try:
+                page_text = await asyncio.wait_for(
+                    _fetch_page_text(r["url"]),
+                    timeout=WEB_FETCH_TIMEOUT + 1.0,
+                )
+            except (asyncio.TimeoutError, Exception) as e:
+                log.debug("deep fetch timed out %s: %s", r["url"], e)
+                page_text = ""
+            if page_text:
+                deep[r["url"]] = page_text
+                break  # достаточно одной страницы с точными данными
+
+    return _format_search_results(results, deep)
 
 
 @dp.message(ALLOWED_FILTER, Command("start"))
