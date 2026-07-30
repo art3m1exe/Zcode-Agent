@@ -99,6 +99,10 @@ def build_system_prompt(web_on: bool) -> str:
             "поездов/рейсов, точное время отправления и прибытия, станции, "
             "цены. Никогда не отправляй пользователя искать информацию "
             "самостоятельно, если данные можно извлечь из поиска. "
+            "Если подробного расписания на конкретную дату нет в поиске, "
+            "напиши доступные базовые поезда на данном маршруте (например, "
+            "ежедневный «Ласточка», фирменные/скорые поезда) и "
+            "ориентировочное время в пути — не отказывай в ответе. "
             "НИКОГДА не генерируй теги <tool_call> или XML-структуры в тексте "
             "ответа: для вызова функции используй только штатный механизм "
             "function-calling. В тексте ответа для пользователя не должно быть "
@@ -271,22 +275,56 @@ def _format_search_results(results: list[dict], deep: dict[str, str]) -> str:
     return "\n\n".join(lines)
 
 
+def _answer_from_snippets(query: str, search_result: str) -> str:
+    """Собирает человекочитаемый ответ из сниппетов, если модель не справилась
+    (упорно шлёт теги <tool_call>). Показываем найденное, а не «Не удалось».
+    """
+    if not search_result or "недоступна" in search_result or "ничего не найдено" in search_result:
+        return (
+            "К сожалению, подробных данных по этому запросу найти не удалось.\n"
+            "Для точного расписания/билетов проверьте:\n"
+            "• Яндекс.Расписания — rasp.yandex.ru\n"
+            "• Tutu.ru — tutu.ru\n"
+            "• РЖД — rzd.ru"
+        )
+    # Обрезаем слишком длинную простыню сниппетов — оставляем читаемое.
+    text = search_result
+    if len(text) > TG_MSG_LIMIT:
+        text = text[:TG_MSG_LIMIT].rsplit("\n", 1)[0] + "\n…"
+    return f"Вот что удалось найти по запросу «{query}»:\n\n{text}"
+
+
 async def _web_search(query: str) -> str:
     """Веб-поиск + глубокий парсинг релевантных страниц, с жёсткими таймаутами.
 
-    1) ddgs в фоне (to_thread) под wait_for(WEB_TIMEOUT).
-    2) Если среди ссылок есть сайты расписаний/билетов (WEB_DEEP_HOSTS),
+    1) Упрощаем запрос (_simplify_query): убираем даты в кавычках и лишние
+       слова — иначе DDG ничего не находит по перегруженному запросу.
+    2) ddgs в фоне (to_thread) под wait_for(WEB_TIMEOUT).
+    3) Если среди ссылок есть сайты расписаний/билетов (WEB_DEEP_HOSTS),
        тянем и парсим первую такую страницу — в ней точные время/номера.
-    Все сетевые операции — неблокирующие; на любом сбое fallback на сниппеты.
+       Парсинг факультативен: при 403/404/пустоте молча падаем на сниппеты.
+    Все сетевые операции — неблокирующие.
     """
+    simple = _simplify_query(query)
+    log.info("web_search: original=%r simplified=%r", query, simple)
     try:
         results = await asyncio.wait_for(
-            asyncio.to_thread(_ddg_search, query),
+            asyncio.to_thread(_ddg_search, simple or query),
             timeout=WEB_TIMEOUT,
         )
     except (asyncio.TimeoutError, Exception) as e:
         log.error("Search failed or timed out: %s", e)
         return "Информация из поиска недоступна."
+
+    # Если упрощённый запрос ничего не дал — пробуем исходный (на всякий).
+    if not results and simple and simple != query:
+        try:
+            results = await asyncio.wait_for(
+                asyncio.to_thread(_ddg_search, query),
+                timeout=WEB_TIMEOUT,
+            )
+        except (asyncio.TimeoutError, Exception):
+            results = []
 
     if not results:
         return "Информация из поиска недоступна."
@@ -592,35 +630,42 @@ async def _stream_answer(chat_id, model, placeholder, _tool_attempts: int = 0) -
 
     # Перехват текстового tool_call: модель не использовала function-calling.
     query = _parse_text_tool_call(full)
-    if query and _tool_attempts < MAX_TOOL_ATTEMPTS:
-        log.info("text tool_call intercepted (attempt %d), query=%r",
-                 _tool_attempts + 1, query)
-        await _safe_edit(placeholder, f"🔍 Ищу: {query[:100]}…")
-        result = await _web_search(query)
-        history[chat_id].append({"role": "assistant", "content": full})
-        history[chat_id].append(
-            {
-                "role": "user",
-                "content": (
-                    f"Результаты веб-поиска по запросу «{query}»:\n{result}\n\n"
-                    "На основе этих результатов дай пользователю краткий "
-                    "человеческий ответ. НЕ используй теги <tool_call>."
-                ),
-            }
-        )
-        # Рекурсивный вызов — теперь модель должна ответить нормально.
-        await _stream_answer(chat_id, model, placeholder, _tool_attempts + 1)
-        return
     if query:
-        # Лимит перехватов исчерпан — модель упорно шлёт теги. Чистим и отдаём
-        # как есть, вырезав сами теги, чтобы не пугать юзера разметкой.
-        log.warning("tool_call attempts exhausted, stripping tags")
-        full = re.sub(r"<tool_call>.*?</tool_call>", "", full, flags=re.DOTALL).strip()
-        if not full:
-            full = "Не удалось получить ответ."
-
-    # Чистый человеческий ответ — обычный путь.
-    history[chat_id].append({"role": "assistant", "content": full})
+        # Упрощаем запрос: модель часто формирует перегруженный
+        # ('"маршрут" 17.08.2026 билеты'), от которого DDG пуст.
+        simple_q = _simplify_query(query) or query
+        if _tool_attempts < MAX_TOOL_ATTEMPTS:
+            log.info("text tool_call intercepted (attempt %d), query=%r -> %r",
+                     _tool_attempts + 1, query, simple_q)
+            await _safe_edit(placeholder, f"🔍 Ищу: {simple_q[:100]}…")
+            result = await _web_search(simple_q)
+            # ВАЖНО: в историю кладём НЕ сырой <tool_call> (он учит модель
+            # плохому), а чистую ассистент-пометку + результат поиска.
+            history[chat_id].append({"role": "assistant", "content": "[вызов web_search]"})
+            history[chat_id].append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Результаты веб-поиска по запросу «{simple_q}»:\n{result}\n\n"
+                        "На основе этих результатов дай пользователю краткий "
+                        "человеческий ответ обычным текстом. НЕ используй теги "
+                        "<tool_call> и не вызывай функцию снова — просто ответь."
+                    ),
+                }
+            )
+            # Рекурсивный вызов — теперь модель должна ответить нормально.
+            await _stream_answer(chat_id, model, placeholder, _tool_attempts + 1)
+            return
+        # Лимит перехватов исчерпан: модель упорно шлёт теги. Не сдаёмся с
+        # «Не удалось» — сами ищем и собираем ответ из сниппетов.
+        log.warning("tool_call attempts exhausted, building answer from search")
+        await _safe_edit(placeholder, f"🔍 Ищу: {simple_q[:100]}…")
+        result = await _web_search(simple_q)
+        full = _answer_from_snippets(simple_q, result)
+        history[chat_id].append({"role": "assistant", "content": full})
+    else:
+        # Чистый человеческий ответ — обычный путь.
+        history[chat_id].append({"role": "assistant", "content": full})
 
     chunks = [full[i:i + TG_MSG_LIMIT] for i in range(0, len(full), TG_MSG_LIMIT)]
     # Финальный ответ — с fallback по разметке: сырые символы в ответе/ссылках
@@ -647,6 +692,32 @@ def _parse_text_tool_call(text: str) -> str:
     if has_web and m:
         return m.group(1).strip()
     return ""
+
+
+def _simplify_query(query: str) -> str:
+    """Упрощает поисковый запрос для DuckDuckGo.
+
+    Модель часто формирует перегруженный запрос с точными датами в кавычках
+    ('"поезд Санкт-Петербург Кондопога" 17.08.2026 расписание билеты'),
+    из-за чего DDG ничего не находит. Убираем кавычки, даты, лишние слова и
+    приводим к простому виду: 'поезд Санкт Петербург Кондопога расписание'.
+    """
+    q = (query or "").strip()
+    # Убираем кавычки (любые).
+    q = q.replace("«", " ").replace("»", " ").replace('"', " ").replace("'", " ")
+    # Убираем даты: 17.08.2026, 17-08-2026, 2026-08-17, 17 августа и т.п.
+    q = re.sub(r"\b\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}\b", " ", q)
+    q = re.sub(r"\b\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}\b", " ", q)
+    q = re.sub(r"\b\d{1,2}\s+(?:янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек)\w*", " ", q, flags=re.IGNORECASE)
+    # Убираем года отдельно.
+    q = re.sub(r"\b(19|20)\d{2}\b", " ", q)
+    # Лишние служебные слова, которые мешают поиску.
+    q = re.sub(r"\b(билеты?|купить|цена|стоимость|заказать)\b", " ", q, flags=re.IGNORECASE)
+    # Схлопываем повторы пробелов.
+    q = re.sub(r"\s+", " ", q).strip()
+    # Отрезаем висячие предлоги/союзы в конце ('... на', '... и').
+    q = re.sub(r"\s+(на|и|или|с|от|до|в|к|по|для)$", "", q, flags=re.IGNORECASE)
+    return q
 
 
 async def _safe_edit(message: Message, text: str):
