@@ -42,7 +42,11 @@ WEB_MODEL = os.environ.get("WEB_MODEL", "glm-4.6")
 # Ключ Яндекс.Расписаний (https://yandex.ru/dev/rasp). Без него интеграция
 # с реальными расписаниями поездов выключена — бот честно об этом скажет.
 YANDEX_RASP_KEY = os.getenv("YANDEX_RASP_KEY", "")
-YANDEX_RASP_URL = "https://api.rasp.yandex.net/v3.0/search/"
+# Актуальный домен + резервный (api.rasp.yandex.net устарел, но отвечает).
+YANDEX_RASP_URLS = (
+    "https://api.rasp.yandex-net.ru/v3.0/search/",
+    "https://api.rasp.yandex.net/v3.0/search/",
+)
 
 ALLOWED_IDS = {
     int(x)
@@ -208,8 +212,8 @@ YANDEX_STATIONS = {
     "тюмень": "c296",
     "ярославль": "c108",
     "мурманск": "c282",
-    "кондопога": "c3453",
-    "петрозаводск": "c3496",
+    "кондопога": "s9603093",
+    "петрозаводск": "s9603421",
     "тверь": "c78",
     "балашиха": "c5888465",
     "подольск": "c5874515",
@@ -286,18 +290,34 @@ def _format_yandex_rasp(data: dict) -> str:
     return "Реальное расписание (Яндекс.Расписания API):\n" + "\n".join(lines)
 
 
+def _extract_date(text: str) -> str:
+    """Достаёт дату из запроса в формате YYYY-MM-DD, иначе пусто."""
+    t = text or ""
+    m = re.search(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})", t)
+    if m:
+        d, mo, y = m.group(1), m.group(2), m.group(3)
+        if len(y) == 2:
+            y = "20" + y
+        return f"{y}-{int(mo):02d}-{int(d):02d}"
+    return ""
+
+
 async def _yandex_rasp_search(text: str) -> str:
     """Прямой запрос к Яндекс.Расписаниям для поездов между станциями.
 
     Возвращает '' если интеграция выключена (нет ключа), не распознаны города
-    или нет рейсов. Все ошибки тихие — вызов идёт из _web_search с fallback.
+    или нет рейсов. Все причины логируются на INFO, чтобы в логах было видно
+    yandex=yes/no и почему. Вызов идёт из _web_search с fallback на DDG.
     """
     if not YANDEX_RASP_KEY:
+        log.info("yandex=no (no YANDEX_RASP_KEY)")
         return ""
     codes = _find_station_codes(text)
     if not codes:
+        log.info("yandex=no (cities not recognized in %r)", text)
         return ""
     from_code, to_code = codes
+    date = _extract_date(text)
     params = {
         "apikey": YANDEX_RASP_KEY,
         "from": from_code,
@@ -306,18 +326,38 @@ async def _yandex_rasp_search(text: str) -> str:
         "lang": "ru_RU",
         "transport_types": "train,suburban",
     }
+    if date:
+        params["date"] = date
+    log.info("yandex API: from=%s to=%s date=%s", from_code, to_code, date or "(today)")
+
+    # Пробуем домены по очереди: актуальный -> устаревший.
+    timeout = aiohttp.ClientTimeout(total=WEB_TIMEOUT)
     try:
-        timeout = aiohttp.ClientTimeout(total=WEB_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(YANDEX_RASP_URL, params=params) as resp:
-                if resp.status != 200:
-                    log.debug("yandex rasp status %s", resp.status)
-                    return ""
-                data = await resp.json(content_type=None)
+            for url in YANDEX_RASP_URLS:
+                try:
+                    async with session.get(url, params=params) as resp:
+                        if resp.status != 200:
+                            log.warning("yandex rasp %s -> status %s", url, resp.status)
+                            continue
+                        data = await resp.json(content_type=None)
+                        # API может вернуть 200 с ошибкой в теле.
+                        if data.get("error"):
+                            log.warning("yandex rasp error body: %s", data.get("error"))
+                            continue
+                        out = _format_yandex_rasp(data)
+                        if out:
+                            log.info("yandex=yes (%d chars via %s)", len(out), url)
+                            return out
+                        log.info("yandex=no (200 OK but no segments)")
+                        return ""
+                except Exception as e:
+                    log.debug("yandex rasp %s exc: %s", url, e)
+                    continue
     except Exception as e:
-        log.debug("yandex rasp failed: %s", e)
-        return ""
-    return _format_yandex_rasp(data)
+        log.warning("yandex rasp session failed: %s", e)
+    log.info("yandex=no (all domains failed)")
+    return ""
 
 
 def _ddg_search(query: str) -> list[dict]:
