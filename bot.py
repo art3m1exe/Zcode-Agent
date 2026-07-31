@@ -15,9 +15,11 @@ from datetime import datetime
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, TelegramObject, Update
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 
@@ -152,11 +154,33 @@ logging.basicConfig(
 )
 log = logging.getLogger("glm-bot")
 
+# AiohttpSession с увеличенным таймаутом: amvera иногда держит сетевые задержки
+# дольше дефолта aiogram (30с), после чего вылетает 'Request timeout error' и
+# роняет весь процесс. 120с дают запросу дойти.
+_session = AiohttpSession(timeout=120)
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    session=_session,
 )
 dp = Dispatcher()
+
+
+@dp.error()
+async def on_error(event: dict, exception: Exception):
+    """Глобальный перехват ошибок: сетевой таймаут Telegram не должен ронять бот.
+
+    TelegramNetworkError ('Request timeout error') возникает при задержках сети
+    в amvera — логируем и глушим, чтобы процесс не упал. Прочие исключения тоже
+    не даем пробить polling: логируем с traceback.
+    """
+    update: Update | None = event.get("update")
+    uid = update.update_id if update else "?"
+    if isinstance(exception, TelegramNetworkError):
+        log.warning("TelegramNetworkError on update %s (suppressed): %s", uid, exception)
+        return True  # обработано, не падать
+    log.exception("Unhandled error on update %s: %s", uid, exception)
+    return True
 
 glm = AsyncOpenAI(api_key=GLM_API_KEY, base_url=GLM_BASE_URL)
 
