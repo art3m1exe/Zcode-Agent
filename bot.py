@@ -1183,7 +1183,13 @@ async def main():
     log.info("ENV WEB_MODEL=%s", WEB_MODEL)
     log.info("ENV YANDEX_RASP_KEY=%s", "set" if YANDEX_RASP_KEY else "not set")
     log.info("ENV ALLOWED_CHAT_IDS=%s", sorted(ALLOWED_IDS))
-    await bot.delete_webhook(drop_pending_updates=True)
+    # delete_webhook роняет весь процесс при сетевом таймауте amvera —
+    # обернём: для long-polling вебхук и так не нужен, отсутствие ответа
+    # не должно быть фатальным.
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        log.warning("Failed to delete webhook: %s", e)
     await dp.start_polling(bot)
 
 
