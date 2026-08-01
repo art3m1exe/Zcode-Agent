@@ -19,7 +19,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command
-from aiogram.types import Message, TelegramObject, Update
+from aiogram.types import ErrorEvent, Message, TelegramObject, Update
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 
@@ -168,14 +168,16 @@ dp = Dispatcher()
 
 
 @dp.error()
-async def on_error(event: dict, exception: Exception):
+async def on_error(event: ErrorEvent):
     """Глобальный перехват ошибок: сетевой таймаут Telegram не должен ронять бот.
 
-    TelegramNetworkError ('Request timeout error') возникает при задержках сети
-    в amvera — логируем и глушим, чтобы процесс не упал. Прочие исключения тоже
-    не даем пробить polling: логируем с traceback.
+    aiogram 3 передаёт ОДИН ErrorEvent (update + exception в нём), а не два
+    позиционных аргумента. TelegramNetworkError ('Request timeout error')
+    возникает при задержках сети в amvera — логируем и глушим. Прочие
+    исключения логируем с traceback, polling не рвём.
     """
-    update: Update | None = event.get("update")
+    exception = event.exception
+    update = event.update
     uid = update.update_id if update else "?"
     if isinstance(exception, TelegramNetworkError):
         log.warning("TelegramNetworkError on update %s (suppressed): %s", uid, exception)
@@ -447,10 +449,13 @@ async def _yandex_rasp_search(text: str) -> str:
     async with aiohttp.ClientSession() as session:
         for url in YANDEX_RASP_URLS:
             try:
-                async with asyncio.wait_for(
+                # wait_for — это корутина, а не async-context-manager:
+                # берём await, затем response используем как контекст.
+                resp = await asyncio.wait_for(
                     session.get(url, params=params),
                     timeout=WEB_TIMEOUT,
-                ) as resp:
+                )
+                async with resp:
                     if resp.status != 200:
                         log.warning("yandex rasp %s -> status %s", url, resp.status)
                         continue
