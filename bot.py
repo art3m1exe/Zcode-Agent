@@ -246,7 +246,7 @@ YANDEX_STATIONS = {
     "тюмень": "c296",
     "ярославль": "c108",
     "мурманск": "c282",
-    "кондопога": "c10931",
+    "кондопога": "s9603093",
     "петрозаводск": "c1439",
     "тверь": "c78",
     "балашиха": "c5888465",
@@ -416,22 +416,11 @@ def _extract_date(text: str) -> str:
     return ""
 
 
-async def _yandex_rasp_search(text: str) -> str:
-    """Прямой запрос к Яндекс.Расписаниям для поездов между станциями.
+async def _yandex_fetch(from_code: str, to_code: str, date: str = "") -> dict | None:
+    """Один запрос к Яндекс.Расписаниям. Возвращает JSON-ответ или None.
 
-    Возвращает '' если интеграция выключена (нет ключа), не распознаны города
-    или нет рейсов. Все причины логируются на INFO, чтобы в логах было видно
-    yandex=yes/no и почему. Вызов идёт из _web_search с fallback на DDG.
+    Перебирает домены с независимым таймаутом WEB_TIMEOUT каждый.
     """
-    if not YANDEX_RASP_KEY:
-        log.info("yandex=no (no YANDEX_RASP_KEY)")
-        return ""
-    codes = _find_station_codes(text)
-    if not codes:
-        log.info("yandex=no (cities not recognized in %r)", text)
-        return ""
-    from_code, to_code = codes
-    date = _extract_date(text)
     params = {
         "apikey": YANDEX_RASP_KEY,
         "from": from_code,
@@ -442,23 +431,17 @@ async def _yandex_rasp_search(text: str) -> str:
     }
     if date:
         params["date"] = date
-    log.info("yandex API: from=%s to=%s date=%s", from_code, to_code, date or "(today)")
-
-    # Перебираем домены; у каждого свой независимый таймаут WEB_TIMEOUT,
-    # чтобы зависший первый домен не съел бюджет второго.
     async with aiohttp.ClientSession() as session:
         for url in YANDEX_RASP_URLS:
             try:
-                # wait_for — это корутина, а не async-context-manager:
-                # берём await, затем response используем как контекст.
                 resp = await asyncio.wait_for(
                     session.get(url, params=params),
                     timeout=WEB_TIMEOUT,
                 )
                 async with resp:
-                    log.info("Yandex API Status: %s (url=%s)", resp.status, url)
+                    log.info("Yandex API Status: %s (url=%s, date=%s)",
+                             resp.status, url, date or "(базовое)")
                     if resp.status != 200:
-                        # Тело несёт пояснение: «Неверный ключ» / «станция не найдена».
                         try:
                             err_body = await resp.json(content_type=None)
                             err = err_body.get("error")
@@ -469,20 +452,62 @@ async def _yandex_rasp_search(text: str) -> str:
                                     resp.status, err_text)
                         continue
                     data = await resp.json(content_type=None)
-                    # API может вернуть 200 с ошибкой в теле.
                     if data.get("error"):
                         log.warning("yandex rasp error body: %s", data.get("error"))
                         continue
-                    out = _format_yandex_rasp(data)
-                    if out:
-                        log.info("yandex=yes (%d chars via %s)", len(out), url)
-                        return out
-                    log.info("yandex=no (200 OK but no segments)")
-                    return ""
+                    return data
             except (asyncio.TimeoutError, Exception) as e:
                 log.warning("yandex rasp %s exc: %s", url, e)
                 continue
-    log.info("yandex=no (all domains failed)")
+    return None
+
+
+async def _yandex_rasp_search(text: str) -> str:
+    """Прямой запрос к Яндекс.Расписаниям для поездов между станциями.
+
+    Умный fallback: если на конкретную дату segments пуст (РЖД ещё не открыл
+    продажи на дальнюю дату) — повторяем запрос БЕЗ date и показываем базовое
+    расписание по маршруту с пометкой, что продажи на дату могут быть не открыты.
+    Все причины логируются. Вызов идёт из _web_search с fallback на DDG.
+    """
+    if not YANDEX_RASP_KEY:
+        log.info("yandex=no (no YANDEX_RASP_KEY)")
+        return ""
+    codes = _find_station_codes(text)
+    if not codes:
+        log.info("yandex=no (cities not recognized in %r)", text)
+        return ""
+    from_code, to_code = codes
+    date = _extract_date(text)
+    log.info("yandex API: from=%s to=%s date=%s", from_code, to_code, date or "(today)")
+
+    data = await _yandex_fetch(from_code, to_code, date)
+    if data is None:
+        log.info("yandex=no (all domains failed)")
+        return ""
+
+    segments = data.get("segments") or []
+    if segments:
+        out = _format_yandex_rasp(data)
+        log.info("yandex=yes (%d chars)", len(out))
+        return out
+
+    # Пусто на конкретную дату — пробуем базовое расписание (без date).
+    if date:
+        log.info("yandex: no segments on %s, retry base schedule (no date)", date)
+        base = await _yandex_fetch(from_code, to_code, "")
+        base_segments = (base or {}).get("segments") or []
+        if base_segments:
+            out = _format_yandex_rasp(base)
+            header = (
+                f"На {date} точного расписания/билетов ещё нет (продажа "
+                f"может быть не открыта), но по этому маршруту курсируют:\n\n"
+            )
+            out = header + out
+            log.info("yandex=yes (base schedule, %d trains)", len(base_segments))
+            return out
+
+    log.info("yandex=no (no segments)")
     return ""
 
 
