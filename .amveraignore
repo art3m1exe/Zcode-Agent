@@ -1,0 +1,14 @@
+# Файлы, исключаемые из архива сборки Amvera (не .gitignore — amvera архивирует
+# рабочий каталог целиком, и локальный venv/ тянул ~100MB в прод).
+venv/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+.zcode/
+.agents/
+.claude/
+skills-lock.json
+img/
+.git/

@@ -10,7 +10,7 @@ import os
 import re
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -37,17 +37,19 @@ except ImportError:
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GLM_API_KEY = os.environ.get("GLM_API_KEY", "")
-GLM_BASE_URL = os.environ.get("GLM_BASE_URL", "https://api.z.ai/api/coding/paas/v4")
-DEFAULT_MODEL = os.environ.get("GLM_MODEL", "glm-5.2")
-# Модель для web-режима: glm-4.6 — подтверждённый function calling, дешевле.
-WEB_MODEL = os.environ.get("WEB_MODEL", "glm-4.6")
+# Обычный план Z.ai (бесплатный glm-4.5-flash). Для Coding Plan: /api/coding/paas/v4.
+GLM_BASE_URL = os.environ.get("GLM_BASE_URL", "https://api.z.ai/api/paas/v4")
+DEFAULT_MODEL = os.environ.get("GLM_MODEL", "glm-4.5-flash")
+# Модель для web-режима (function calling). glm-4.5-flash поддерживает его и бесплатна.
+WEB_MODEL = os.environ.get("WEB_MODEL", "glm-4.5-flash")
 # Ключ Яндекс.Расписаний (https://yandex.ru/dev/rasp). Без него интеграция
 # с реальными расписаниями поездов выключена — бот честно об этом скажет.
 YANDEX_RASP_KEY = os.getenv("YANDEX_RASP_KEY", "")
-# Актуальный домен + резервный (api.rasp.yandex.net устарел, но отвечает).
+# Оба домена отвечают на запрос (проверено: HTTP 400 на фейковый ключ = живой
+# эндпоинт). Перебираем оба — если первый упадёт/зависнет, второй подхватит.
 YANDEX_RASP_URLS = (
-    "https://api.rasp.yandex-net.ru/v3.0/search/",
     "https://api.rasp.yandex.net/v3.0/search/",
+    "https://api.rasp.yandex-net.ru/v3.0/search/",
 )
 
 ALLOWED_IDS = {
@@ -97,24 +99,23 @@ def build_system_prompt(web_on: bool) -> str:
     )
     if web_on:
         return base + (
-            " У тебя ЕСТЬ доступ в интернет через функцию поиска. "
-            "Если пользователь спрашивает про погоду, актуальные события, "
-            "курсы, цены, версии, даты или любые свежие факты — ты ОБЯЗАН "
-            "использовать web_search и отвечать на основе найденного, "
-            "указывая источники. НИКОГДА не пиши, что у тебя нет доступа к "
-            "интернету или что твои знания ограничены каким-либо годом: "
-            "всегда сначала ищи, потом отвечай. "
-            "При ответе на запросы о расписаниях, билетах и мероприятиях ты "
-            "ОБЯЗАН указывать ТОЛЬКО точные данные из найденного текста: "
-            "номера поездов/рейсов, точное время отправления и прибытия, "
-            "станции, цены — и только если они реально есть в результатах "
-            "поиска. КРИТИЧЕСКИ ВАЖНО: если у тебя нет точно распарсенных "
-            "данных с номерами поездов и временем, прямо пиши, что "
-            "динамическое расписание доступно только на официальных сайтах "
-            "(Яндекс.Расписания, Tutu, РЖД), и НИКОГДА не выдумывай часы "
-            "отправления/прибытия, номера рейсов или цены. Лучше честно "
-            "сказать «точное время не нашлось» и дать ссылки, чем назвать "
-            "придуманное время. "
+            " ГЛАВНОЕ ПРАВИЛО: точность важнее полноты. "
+            "У тебя ЕСТЬ доступ в интернет через функцию поиска: если "
+            "пользователь спрашивает про погоду, актуальные события, курсы, "
+            "цены, версии, даты или любые свежие факты — сначала ищи через "
+            "web_search и отвечай на основе найденного, указывая источники. "
+            "НИКОГДА не пиши, что у тебя нет доступа к интернету или что твои "
+            "знания ограничены каким-либо годом: всегда сначала ищи, потом "
+            "отвечай. "
+            "По расписаниям, билетам и мероприятиям указывай номера "
+            "поездов/рейсов, время отправления/прибытия, станции, цены "
+            "ТОЛЬКО если они реально есть в результатах поиска. Если точных "
+            "данных нет — прямо скажи, что динамическое расписание доступно "
+            "только на официальных сайтах (Яндекс.Расписания, Tutu, РЖД), "
+            "и дай ссылки. НИКОГДА не выдумывай время, номера рейсов или "
+            "цены: лучше честно написать «точное время не нашлось», чем "
+            "назвать придуманное. Это правило сильнее, чем «ответить любой "
+            "ценой». "
             "НИКОГДА не генерируй теги <tool_call> или XML-структуры в тексте "
             "ответа: для вызова функции используй только штатный механизм "
             "function-calling. В тексте ответа для пользователя не должно быть "
@@ -202,10 +203,17 @@ def _ensure_system(chat_id: int, web_on: bool) -> None:
     """Гарантирует, что история начинается с актуального system-сообщения.
 
     Содержимое пересобирается под текущий web-режим при каждом сообщении,
-    чтобы переключение /web сразу меняло инструкции модели.
+    чтобы переключение /web сразу меняло инструкции модели. При выключении
+    web-режима tool-связки фильтруются — иначе role=tool без tools= ломают
+    запрос к модели.
     """
     prompt = build_system_prompt(web_on)
     msgs = history[chat_id]
+    if not web_on and any(m.get("role") in ("tool",) or
+                          (m.get("role") == "assistant" and m.get("tool_calls"))
+                          for m in msgs):
+        history[chat_id] = _strip_tool_messages(msgs)
+        msgs = history[chat_id]
     if msgs and msgs[0].get("role") == "system":
         msgs[0]["content"] = prompt
     else:
@@ -244,33 +252,68 @@ YANDEX_STATIONS = {
 }
 
 
+def _normalize_city(word: str) -> str:
+    """Сводит слово к словарной форме:剥 типичные падежные окончания.
+
+    Москва/Москвы/Москве/Москву → москва, Казань/Казани → казан,
+    Питера/Питере → питер, Уфа/Уфы/Уфе → уф. Корень минимум 3 символа.
+    """
+    w = word.lower()
+    for suf in ("ами", "ях", "ев", "ов", "ах", "ой", "ей", "ом", "ем",
+                "е", "ы", "у", "ю", "а", "я", "и", "ь"):
+        #剥 только если корень останется >= 3 символов; для совсем коротких
+        # (уфа/уфы) опускаем порог до 2, иначе падеж не свернётся.
+        limit = 2 if len(w) <= 4 else 3
+        if len(w) - len(suf) >= limit and w.endswith(suf):
+            return w[: -len(suf)]
+    return w
+
+
 def _find_station_codes(text: str) -> tuple[str, str] | None:
     """Пытается найти в тексте запроса пару городов → коды станций.
 
-    Возвращает (from_code, to_code) или None. Соединитель ('—', '-', 'до',
-    'в', 'из') необязателен: берём первые два известных города по порядку.
-    Учитывает падежи: «Москвы», «Питере» сводятся к словарной форме через
-    сравнение слова с началом словарной формы (startswitch по корню).
+    Возвращает (from_code, to_code) или None. Берём первые два распознанных
+    города по порядку в тексте. Поддержка падежей (через剥 окончаний),
+    составных названий («санкт-петербург», «нижний новгород») и коротких имён.
     """
     t = (text or "").lower()
-    t = t.replace("—", " ").replace("–", " ")
-    # Токенизируем по не-буквам, сохраняя порядок и позицию.
+    norm = " " + t + " "
+
+    # (позиция, код): сканируем словарь, приоритет — составным (длинным) ключам.
+    found: list[tuple[int, str]] = []
+    # Сортируем ключи по убыванию длины, чтобы «санкт-петербург» матчился
+    # раньше «петербург», а «ростов-на-дону» — раньше «ростов».
+    items = sorted(YANDEX_STATIONS.items(), key=lambda kv: -len(kv[0]))
+    matched_spans: list[tuple[int, int]] = []  # (start, end) занятых позиций
+
+    for name, code in items:
+        # 1) Составные/с дефисом — ищем подстрокой (нормализуем дефисы).
+        needle = name.replace("-", " ")
+        hay = norm.replace("-", " ")
+        idx = hay.find(needle)
+        while idx != -1:
+            start, end = idx, idx + len(needle)
+            if not any(not (end <= s or start >= e) for s, e in matched_spans):
+                matched_spans.append((start, end))
+                found.append((start, code))
+                break
+            idx = hay.find(needle, idx + 1)
+
+    # 2) Одиночные слова (в т.ч. короткие) через剥 окончаний.
     tokens = [(m.start(), m.group()) for m in re.finditer(r"[а-яёa-z]+", t)]
-    found = []  # (позиция, код)
     for pos, tok in tokens:
-        for name, code in YANDEX_STATIONS.items():
-            # Точное совпадение либо совпадение по корню (минимум 4 символа),
-            # чтобы покрывать падежи: Москва/Москвы/Москве, Казань/Казани.
-            if tok == name or (
-                len(name) >= 4
-                and len(tok) >= 4
-                and (
-                    tok.startswith(name[:4])
-                    or name.startswith(tok[:4])
-                )
-            ):
+        # Пропускаем токены, уже покрытые составным матчем.
+        if any(s <= pos < e for s, e in matched_spans):
+            continue
+        norm_tok = _normalize_city(tok)
+        for name, code in items:
+            if " " in name or "-" in name:
+                continue  # составные уже обработаны выше
+            norm_name = _normalize_city(name)
+            if norm_tok == norm_name and norm_name:
                 found.append((pos, code))
                 break
+
     if len(found) < 2:
         return None
     found.sort()  # по позиции в тексте
@@ -292,8 +335,10 @@ def _format_yandex_rasp(data: dict) -> str:
     lines = []
     for s in segments[:8]:  # первые 8 рейсов, чтобы не раздувать контекст
         thread = s.get("thread", {}) or {}
-        dep = (s.get("departure") or "")[11:16]  # HH:MM
-        arr = (s.get("arrival") or "")[11:16]
+        dep_raw = s.get("departure") or ""
+        arr_raw = s.get("arrival") or ""
+        dep = dep_raw[11:16] if len(dep_raw) >= 16 else "—"
+        arr = arr_raw[11:16] if len(arr_raw) >= 16 else "—"
         number = thread.get("number", "")
         title = thread.get("title", "")
         ttype = {"train": "поезд", "suburban": "электричка",
@@ -302,11 +347,20 @@ def _format_yandex_rasp(data: dict) -> str:
         dur = s.get("duration")
         dur_h = f"{dur // 3600:.0f}ч {dur % 3600 // 60:02d}м" if dur else ""
         price = ""
+        # Современный формат: prices.whole.price. Фоллбэк: tickets_info[].price.
         prices = s.get("prices") or {}
         if isinstance(prices, dict):
             pwhole = prices.get("whole") or {}
             if isinstance(pwhole, dict) and pwhole.get("price"):
                 price = f", от {pwhole['price']}₽"
+        if not price:
+            ti = s.get("tickets_info") or []
+            for t in ti:
+                tp = (t.get("price") or {}) if isinstance(t, dict) else {}
+                place = tp.get("price") if isinstance(tp, dict) else None
+                if place:
+                    price = f", от {place}₽"
+                    break
         lines.append(
             f"• {ttype} {number} {title}: отпр {dep} → приб {arr}"
             f"{(' (' + dur_h + ')') if dur_h else ''}{price}"
@@ -314,15 +368,49 @@ def _format_yandex_rasp(data: dict) -> str:
     return "Реальное расписание (Яндекс.Расписания API):\n" + "\n".join(lines)
 
 
+_MONTHS = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11,
+    "декабря": 12,
+    "янв": 1, "фев": 2, "мар": 3, "апр": 4, "июн": 6, "июл": 7, "авг": 8,
+    "сен": 9, "окт": 10, "ноя": 11, "дек": 12,
+}
+
+
 def _extract_date(text: str) -> str:
-    """Достаёт дату из запроса в формате YYYY-MM-DD, иначе пусто."""
-    t = text or ""
+    """Достаёт дату из запроса в формате YYYY-MM-DD, иначе пусто.
+
+    Понимает числовые форматы (17.08.2026, 17/08/26), текстовые («17 августа»)
+    и относительные («завтра», «послезавтра»). Невалидные даты (99.99) → ''.
+    """
+    t = (text or "").lower()
+
+    # Относительные даты.
+    if "послезавтра" in t:
+        return (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
+    if "завтра" in t:
+        return (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    if "сегодня" in t:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    # Числовой формат DD.MM.YYYY.
     m = re.search(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})", t)
     if m:
-        d, mo, y = m.group(1), m.group(2), m.group(3)
+        d, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
         if len(y) == 2:
             y = "20" + y
-        return f"{y}-{int(mo):02d}-{int(d):02d}"
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y}-{mo:02d}-{d:02d}"
+        return ""
+
+    # Текстовый формат: «17 августа», «3 авг».
+    m = re.search(r"(\d{1,2})\s+([а-яё]+)", t)
+    if m:
+        mo = _MONTHS.get(m.group(2))
+        if mo:
+            d = int(m.group(1))
+            if 1 <= d <= 31:
+                return f"{datetime.now().year}-{mo:02d}-{d:02d}"
     return ""
 
 
@@ -354,32 +442,32 @@ async def _yandex_rasp_search(text: str) -> str:
         params["date"] = date
     log.info("yandex API: from=%s to=%s date=%s", from_code, to_code, date or "(today)")
 
-    # Пробуем домены по очереди: актуальный -> устаревший.
-    timeout = aiohttp.ClientTimeout(total=WEB_TIMEOUT)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            for url in YANDEX_RASP_URLS:
-                try:
-                    async with session.get(url, params=params) as resp:
-                        if resp.status != 200:
-                            log.warning("yandex rasp %s -> status %s", url, resp.status)
-                            continue
-                        data = await resp.json(content_type=None)
-                        # API может вернуть 200 с ошибкой в теле.
-                        if data.get("error"):
-                            log.warning("yandex rasp error body: %s", data.get("error"))
-                            continue
-                        out = _format_yandex_rasp(data)
-                        if out:
-                            log.info("yandex=yes (%d chars via %s)", len(out), url)
-                            return out
-                        log.info("yandex=no (200 OK but no segments)")
-                        return ""
-                except Exception as e:
-                    log.debug("yandex rasp %s exc: %s", url, e)
-                    continue
-    except Exception as e:
-        log.warning("yandex rasp session failed: %s", e)
+    # Перебираем домены; у каждого свой независимый таймаут WEB_TIMEOUT,
+    # чтобы зависший первый домен не съел бюджет второго.
+    async with aiohttp.ClientSession() as session:
+        for url in YANDEX_RASP_URLS:
+            try:
+                async with asyncio.wait_for(
+                    session.get(url, params=params),
+                    timeout=WEB_TIMEOUT,
+                ) as resp:
+                    if resp.status != 200:
+                        log.warning("yandex rasp %s -> status %s", url, resp.status)
+                        continue
+                    data = await resp.json(content_type=None)
+                    # API может вернуть 200 с ошибкой в теле.
+                    if data.get("error"):
+                        log.warning("yandex rasp error body: %s", data.get("error"))
+                        continue
+                    out = _format_yandex_rasp(data)
+                    if out:
+                        log.info("yandex=yes (%d chars via %s)", len(out), url)
+                        return out
+                    log.info("yandex=no (200 OK but no segments)")
+                    return ""
+            except (asyncio.TimeoutError, Exception) as e:
+                log.debug("yandex rasp %s exc: %s", url, e)
+                continue
     log.info("yandex=no (all domains failed)")
     return ""
 
@@ -453,7 +541,12 @@ async def _fetch_page_text(url: str) -> str:
                     html = raw.decode(enc, errors="ignore")
                 except (LookupError, UnicodeDecodeError):
                     html = raw.decode("utf-8", errors="ignore")
-        soup = BeautifulSoup(html, "lxml")
+        # lxml быстрее, но если его нет — падает FeatureNotFound; fallback на
+        # встроенный html.parser, чтобы глубокий парсинг не отключался молча.
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            soup = BeautifulSoup(html, "html.parser")
         # Убираем шум.
         for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
             tag.decompose()
@@ -570,24 +663,6 @@ async def _web_search(query: str) -> str:
         return yandex_text
     return snippets or "Информация из поиска недоступна."
 
-    # Глубокий парсинг: первая релевантная страница из разрешённых хостов.
-    deep: dict[str, str] = {}
-    for r in results:
-        if _is_deep_host(r["url"]):
-            try:
-                page_text = await asyncio.wait_for(
-                    _fetch_page_text(r["url"]),
-                    timeout=WEB_FETCH_TIMEOUT + 1.0,
-                )
-            except (asyncio.TimeoutError, Exception) as e:
-                log.debug("deep fetch timed out %s: %s", r["url"], e)
-                page_text = ""
-            if page_text:
-                deep[r["url"]] = page_text
-                break  # достаточно одной страницы с точными данными
-
-    return _format_search_results(results, deep)
-
 
 @dp.message(ALLOWED_FILTER, Command("start"))
 async def cmd_start(message: Message):
@@ -601,7 +676,10 @@ async def cmd_start(message: Message):
 
 @dp.message(ALLOWED_FILTER, Command("clear"))
 async def cmd_clear(message: Message):
-    history[message.chat.id].clear()
+    # Под тем же локом, что и фоновая _process_message — иначе /clear режет
+    # историю прямо под идущей обработкой ответа (race).
+    async with chat_locks[message.chat.id]:
+        history[message.chat.id].clear()
     await message.answer("🧹 Контекст очищен.")
 
 
@@ -665,7 +743,19 @@ async def handle_text(message: Message):
     # Тяжёлая обработка — в фон, polling не блокируется.
     task = asyncio.create_task(_process_message(message, status_msg))
     _bg_tasks.add(task)
-    task.add_done_callback(_bg_tasks.discard)
+    task.add_done_callback(_on_bg_task_done)
+
+
+def _on_bg_task_done(task: asyncio.Task) -> None:
+    """Чистим задачу из набора и логируем потерянное исключение.
+
+    Фоновые задачи выпадают из dp.error(), поэтому без явного извлечения
+    исключение утекло бы с «Task exception was never retrieved».
+    """
+    _bg_tasks.discard(task)
+    exc = task.exception()
+    if exc is not None:
+        log.error("Фоновая задача упала: %s", exc, exc_info=exc)
 
 
 async def _process_message(message: Message, status_msg: Message) -> None:
@@ -716,15 +806,39 @@ async def _send_status(message: Message, text: str):
 
 
 def _trim_history(chat_id: int) -> None:
-    """Держит system + последние HISTORY_LIMIT пар сообщений."""
+    """Держит system + последние сообщения в пределах HISTORY_LIMIT*2.
+
+    Транзакционная обрезка: не оставляем role=tool без предшествующего
+    assistant(tool_calls) — иначе API вернёт 400 на следующем запросе.
+    """
     msgs = history[chat_id]
-    # system не должен вылетать при обрезке.
     sys_part = msgs[:1] if msgs and msgs[0].get("role") == "system" else []
-    rest = msgs[1:] if sys_part else msgs
+    rest = msgs[1:] if sys_part else msgs[:]
     limit = HISTORY_LIMIT * 2
-    if len(rest) > limit:
-        rest = rest[-limit:]
-    history[chat_id] = sys_part + rest
+    if len(rest) <= limit:
+        return
+    keep = rest[-limit:]
+    # Если срез начинается с role=tool — отрезаем «висячие» tool-сообщения,
+    # у которых нет парного assistant(tool_calls) в начале keep.
+    while keep and keep[0].get("role") == "tool":
+        keep = keep[1:]
+    history[chat_id] = sys_part + keep
+
+
+def _strip_tool_messages(msgs: list[dict]) -> list[dict]:
+    """Удаляет tool-связки (assistant с tool_calls + последующие role=tool).
+
+    Нужно при выключении web-режима: role=tool / tool_calls в истории без
+    объявленных tools= ломают запрос к модели.
+    """
+    out: list[dict] = []
+    for m in msgs:
+        if m.get("role") == "tool":
+            continue
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            continue
+        out.append(m)
+    return out
 
 
 # Ключевые слова, при которых поиск обязателен (в web-режиме).
@@ -775,8 +889,20 @@ async def _maybe_search(chat_id, model, placeholder) -> "list | None":
 
     choice = resp.choices[0]
     if choice.finish_reason != "tool_calls" or not choice.message.tool_calls:
-        # Модель решила искать не нужно — отвечаем из знаний (стримингом ниже).
-        log.info("no tool_calls; finish_reason=%s", choice.finish_reason)
+        # Поиск не нужен. Контент уже готов — отдадим его напрямую, без
+        # повторной генерации через _stream_answer (иначе платим дважды и
+        # рискуем рассинхронизацией ответов).
+        content = (choice.message.content or "").strip()
+        if content:
+            history[chat_id].append({"role": "assistant", "content": content})
+            await _safe_edit_fallback(placeholder, content[:TG_MSG_LIMIT])
+            for c in [content[i:i + TG_MSG_LIMIT] for i in range(TG_MSG_LIMIT, len(content), TG_MSG_LIMIT)]:
+                try:
+                    await _send_fallback(chat_id, c)
+                except Exception:
+                    log.exception("send_message chunk failed")
+            return None  # ответ уже отправлен, _stream_answer не нужен
+        log.info("no tool_calls and no content; finish_reason=%s", choice.finish_reason)
         return []
 
     # Сохраняем ассистент-сообщение с tool_calls, как требует схема OpenAI.
@@ -784,6 +910,12 @@ async def _maybe_search(chat_id, model, placeholder) -> "list | None":
 
     for call in choice.message.tool_calls:
         if call.function.name != "web_search":
+            # Чужая функция — кладём заглушку role:tool, иначе API ждёт ответ
+            # для этого tool_call_id и следующий запрос упадёт с 400.
+            history[chat_id].append(
+                {"role": "tool", "tool_call_id": call.id,
+                 "content": "не поддерживается"}
+            )
             continue
         try:
             args = json.loads(call.function.arguments or "{}")
@@ -905,7 +1037,23 @@ async def _stream_answer(chat_id, model, placeholder, _tool_attempts: int = 0) -
         full = _answer_from_snippets(simple_q, result)
         history[chat_id].append({"role": "assistant", "content": full})
     else:
-        # Чистый человеческий ответ — обычный путь.
+        # Чистый человеческий ответ — обычный путь. Но если в стриме был
+        # замечен <tool_call>, а парсер не вытащил запрос (тег оборвался /
+        # нет <arg_value>), не отдавать юзеру сырую разметку: вырезаем всё
+        # с <tool_call> до конца и при пустом остатке ищем сами.
+        if started_tool_tag:
+            cut = full.split("<tool_call>")[0].strip()
+            if cut:
+                full = cut
+            else:
+                last_q = message_text(chat_id) or ""
+                if last_q:
+                    log.warning("incomplete tool_call, fallback search by user msg")
+                    await _safe_edit(placeholder, "🔍 Ищу…")
+                    result = await _web_search(last_q)
+                    full = _answer_from_snippets(_simplify_query(last_q), result)
+                else:
+                    full = "Не удалось получить ответ."
         history[chat_id].append({"role": "assistant", "content": full})
 
     chunks = [full[i:i + TG_MSG_LIMIT] for i in range(0, len(full), TG_MSG_LIMIT)]
@@ -962,10 +1110,11 @@ def _simplify_query(query: str) -> str:
 
 
 async def _safe_edit(message: Message, text: str):
-    """Редактируем сообщение, игнорируя 'not modified' и rate-limit.
+    """Редактируем сообщение plain-текстом, игнорируя 'not modified' и rate-limit.
 
-    На сетевых ошибках (connection pool к Telegram порвался) — пара ретраев
-    с короткой паузой: разрыв обычно кратковременный.
+    Явный parse_mode=None: ответы модели и сниппеты поиска содержат сырые
+    <>[]_*, которые ломают HTML/Markdown-парсинг Telegram (TelegramBadRequest),
+    и плашка «зависает». На сетевых ошибках — пара ретраев с паузой.
     """
     for attempt in range(3):
         try:
@@ -973,6 +1122,7 @@ async def _safe_edit(message: Message, text: str):
                 text=text,
                 chat_id=message.chat.id,
                 message_id=message.message_id,
+                parse_mode=None,
             )
             return
         except Exception as e:
@@ -988,29 +1138,23 @@ async def _safe_edit(message: Message, text: str):
 
 
 async def _safe_edit_fallback(message: Message, text: str):
-    """Финальная правка ответа с fallback по разметке.
+    """Финальная правка ответа plain-текстом.
 
-    Сначала Markdown; если Telegram ругается на разметку (TelegramBadRequest
-    из-за сырых символов/ссылок поиска) — повторяем как чистый текст.
+    Plain (parse_mode=None) единообразно со стримом: сырые символы ссылок/HTML
+    больше не ломают рендер. Совпадает с поведением _safe_edit.
     """
     try:
-        await message.edit_text(text, parse_mode="Markdown")
+        await message.edit_text(text, parse_mode=None)
     except Exception as e:
-        log.debug("Markdown edit failed, retry as plain text: %s", e)
-        try:
-            await message.edit_text(text, parse_mode=None)
-        except Exception as e2:
-            # Не даём плашке зависеть: хотя бы чем-то её обновим.
-            log.debug("plain edit also failed: %s", e2)
+        log.debug("plain edit failed: %s", e)
 
 
 async def _send_fallback(chat_id: int, text: str):
-    """Досылка доп. чанков с fallback по разметке (Markdown → plain)."""
+    """Досылка доп. чанков plain-текстом."""
     try:
-        await bot.send_message(chat_id, text, parse_mode="Markdown")
-    except Exception as e:
-        log.debug("Markdown send failed, retry as plain text: %s", e)
         await bot.send_message(chat_id, text, parse_mode=None)
+    except Exception as e:
+        log.debug("send failed: %s", e)
 
 
 def _mask(value: str) -> str:

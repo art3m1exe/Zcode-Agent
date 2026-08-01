@@ -6,4 +6,7 @@ venv/
 .DS_Store
 *.log
 .zcode/
+.agents/
+.claude/
+skills-lock.json
 img/

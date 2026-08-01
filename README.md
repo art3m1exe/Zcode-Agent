@@ -61,9 +61,11 @@ Amvera поддерживает фоновые long-running процессы (б
    | `BOT_TOKEN` | токен от BotFather |
    | `GLM_API_KEY` | ключ с z.ai |
    | `ALLOWED_CHAT_IDS` | твой chat_id (можно несколько через запятую) |
-   | `GLM_MODEL` | `glm-5.2` (по умолчанию, GLM Coding Plan) |
-   | `WEB_MODEL` | `glm-4.6` (модель для режима `/web`) |
-   | `GLM_BASE_URL` | `https://api.z.ai/api/coding/paas/v4` |
+   | `GLM_MODEL` | `glm-4.5-flash` (по умолчанию, бесплатная, обычный план) |
+   | `WEB_MODEL` | `glm-4.5-flash` (модель для режима `/web`) |
+   | `GLM_BASE_URL` | `https://api.z.ai/api/paas/v4` (обычный план) |
+   | `WEB_BACKEND` | `yandex` (бэкенд поиска ddgs; варианты: brave, yahoo) |
+   | `YANDEX_RASP_KEY` | ключ Яндекс.Расписаний (опционально, для расписаний поездов) |
 
    ⚠️ После добавления секретов — **перезапусти контейнер**.
 
@@ -81,7 +83,7 @@ Amvera поддерживает фоновые long-running процессы (б
 
 ```
 bot.py            # ядро бота
-requirements.txt  # aiogram, openai, python-dotenv, duckduckgo-search
+requirements.txt  # aiogram, openai, python-dotenv, ddgs, beautifulsoup4, aiohttp, lxml
 amvera.yml        # конфиг деплоя
 .env.example      # шаблон переменных окружения
 .gitignore
