@@ -1217,14 +1217,37 @@ async def main():
     log.info("ENV WEB_MODEL=%s", WEB_MODEL)
     log.info("ENV YANDEX_RASP_KEY=%s", "set" if YANDEX_RASP_KEY else "not set")
     log.info("ENV ALLOWED_CHAT_IDS=%s", sorted(ALLOWED_IDS))
+
     # delete_webhook роняет весь процесс при сетевом таймауте amvera —
-    # обернём: для long-polling вебхук и так не нужен, отсутствие ответа
-    # не должно быть фатальным.
+    # обернём: для long-polling вебхук и так не нужен.
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         log.warning("Failed to delete webhook: %s", e)
-    await dp.start_polling(bot)
+
+    # Прогрев: get_me с retry. start_polling внутри зовёт bot.me(), и если
+    # сеть к Telegram в этот момент отвалилась — падает весь процесс. Греем
+    # заранее: пока не получим ответ от Telegram, в polling не идём.
+    for attempt in range(1, 11):
+        try:
+            me = await bot.get_me()
+            log.info("Telegram OK: @%s (attempt %d)", me.username, attempt)
+            break
+        except Exception as e:
+            log.warning("get_me attempt %d failed: %s — retry in 10s", attempt, e)
+            await asyncio.sleep(10)
+    else:
+        log.error("get_me: 10 попыток провалены — выходим")
+        return
+
+    # Цикл polling с восстановлением: если сеть к Telegram отвалилась
+    # (Request timeout error), не роняем процесс, а ждём и перезапускаем.
+    while True:
+        try:
+            await dp.start_polling(bot)
+        except Exception as e:
+            log.error("Polling упал: %s — перезапуск через 15с", e)
+            await asyncio.sleep(15)
 
 
 if __name__ == "__main__":
