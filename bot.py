@@ -246,8 +246,8 @@ YANDEX_STATIONS = {
     "тюмень": "c296",
     "ярославль": "c108",
     "мурманск": "c282",
-    "кондопога": "s9603093",
-    "петрозаводск": "s9603421",
+    "кондопога": "c10931",
+    "петрозаводск": "c1439",
     "тверь": "c78",
     "балашиха": "c5888465",
     "подольск": "c5874515",
@@ -456,8 +456,17 @@ async def _yandex_rasp_search(text: str) -> str:
                     timeout=WEB_TIMEOUT,
                 )
                 async with resp:
+                    log.info("Yandex API Status: %s (url=%s)", resp.status, url)
                     if resp.status != 200:
-                        log.warning("yandex rasp %s -> status %s", url, resp.status)
+                        # Тело несёт пояснение: «Неверный ключ» / «станция не найдена».
+                        try:
+                            err_body = await resp.json(content_type=None)
+                            err = err_body.get("error")
+                            err_text = err.get("text") if isinstance(err, dict) else str(err)
+                        except Exception:
+                            err_text = ""
+                        log.warning("yandex rasp non-200: status=%s err=%s",
+                                    resp.status, err_text)
                         continue
                     data = await resp.json(content_type=None)
                     # API может вернуть 200 с ошибкой в теле.
@@ -471,7 +480,7 @@ async def _yandex_rasp_search(text: str) -> str:
                     log.info("yandex=no (200 OK but no segments)")
                     return ""
             except (asyncio.TimeoutError, Exception) as e:
-                log.debug("yandex rasp %s exc: %s", url, e)
+                log.warning("yandex rasp %s exc: %s", url, e)
                 continue
     log.info("yandex=no (all domains failed)")
     return ""
